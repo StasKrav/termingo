@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"regexp"
 	"strings"
 	"time"
@@ -192,7 +193,7 @@ func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
 		if offsetY+i >= offsetY+availableHeight {
 			continue // Эта строка уже за пределами видимой области
 		}
-		
+
 		segment := t.outputLines[i]
 		// Обрезаем строку если она слишком длинная
 		text := segment.Text
@@ -381,13 +382,13 @@ func (t *Terminal) executeCommand(cmd string) {
 
 	// Обрабатываем команду и получаем вывод
 	resultSegments := t.processCommand(cmd)
-	
+
 	// Добавляем результат команды после самой команды
 	newOutput = append(newOutput, resultSegments...)
-	
+
 	// Добавляем весь старый вывод ПОСЛЕ новой команды и ее результата
 	newOutput = append(newOutput, t.outputLines...)
-	
+
 	// Заменяем старый вывод на новый
 	t.outputLines = newOutput
 
@@ -432,6 +433,18 @@ func (t *Terminal) processCommand(cmd string) []LineSegment {
 			Background(tcell.ColorDefault))
 	case "colors":
 		segments = t.processColorDemo()
+	case "help":
+		segments = t.processHelpCommand()
+	case "history":
+		segments = t.processHistoryCommand()
+	case "cd":
+		segments = t.processCdCommand(args)
+	case "ls":
+		segments = t.processLsCommand(args)
+	case "date":
+		segments = t.processDateCommand()
+	case "whoami":
+		segments = t.processWhoamiCommand()
 	case "run":
 		if len(args) > 1 {
 			segments = t.processSystemCommand(args[1:])
@@ -479,6 +492,199 @@ func (t *Terminal) processColorDemo() []LineSegment {
 	return segments
 }
 
+func (t *Terminal) processHelpCommand() []LineSegment {
+	helpText := `Доступные команды:
+	 exit, quit    - Выйти из терминала
+	 clear         - Очистить экран
+	 echo <text>   - Вывести текст
+	 pwd           - Показать текущую директорию
+	 time          - Показать текущее время
+	 date          - Показать текущую дату
+	 whoami        - Показать имя текущего пользователя
+	 history       - Показать историю команд
+	 ls            - Показать содержимое директории
+	 cd <dir>      - Перейти в директорию
+	 colors        - Демонстрация цветов
+	 help          - Показать это сообщение
+	 run <cmd>     - Выполнить системную команду
+	 <cmd>         - Выполнить системную команду напрямую`
+
+	return parseANSI(helpText, tcell.StyleDefault.
+		Foreground(tcell.ColorWhite).
+		Background(tcell.ColorDefault))
+}
+
+func (t *Terminal) processHistoryCommand() []LineSegment {
+	var segments []LineSegment
+
+	// Отображаем историю команд с номерами
+	for i, cmd := range t.history {
+		historyLine := fmt.Sprintf("%d: %s", i+1, cmd)
+		segments = append(segments, LineSegment{
+			Text:  historyLine,
+			Style: tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorDefault),
+		})
+	}
+
+	return segments
+}
+
+func (t *Terminal) processCdCommand(args []string) []LineSegment {
+	if len(args) < 2 {
+		// Если не указана директория, переходим в домашнюю директорию
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			errorMsg := fmt.Sprintf("\033[31mError: %s\033[0m", err)
+			return parseANSI(errorMsg, tcell.StyleDefault)
+		}
+		args = []string{"cd", homeDir}
+	}
+
+	// Меняем директорию
+	err := os.Chdir(args[1])
+	if err != nil {
+		errorMsg := fmt.Sprintf("\033[31mError: %s\033[0m", err)
+		return parseANSI(errorMsg, tcell.StyleDefault)
+	}
+
+	// Возвращаем пустой сегмент, так как команда cd не должна выводить ничего
+	return []LineSegment{}
+}
+
+func (t *Terminal) processLsCommand(args []string) []LineSegment {
+	// По умолчанию показываем содержимое текущей директории
+	dir := "."
+	longFormat := false
+	showHidden := false
+
+	// Обрабатываем аргументы
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-l" {
+			longFormat = true
+		} else if arg == "-a" {
+			showHidden = true
+		} else if arg == "-la" || arg == "-al" {
+			longFormat = true
+			showHidden = true
+		} else if !strings.HasPrefix(arg, "-") {
+			// Это путь к директории
+			dir = arg
+		}
+	}
+
+	// Получаем список файлов в директории
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		errorMsg := fmt.Sprintf("\033[31mError: %s\033[0m", err)
+		return parseANSI(errorMsg, tcell.StyleDefault)
+	}
+
+	var segments []LineSegment
+
+	// Отображаем содержимое директории
+	for _, entry := range entries {
+		name := entry.Name()
+
+		// Пропускаем скрытые файлы, если не указан флаг -a
+		if !showHidden && strings.HasPrefix(name, ".") {
+			continue
+		}
+
+		if longFormat {
+			// Подробный формат
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			// Определяем тип файла
+			fileType := "-"
+			if entry.IsDir() {
+				fileType = "d"
+			}
+
+			// Права доступа (упрощенно)
+			perms := "rwxr-xr-x"
+
+			// Размер файла
+			size := info.Size()
+
+			// Время модификации
+			modTime := info.ModTime().Format("Jan 02 15:04")
+
+			// Цвет для директорий
+			colorCode := "37" // белый для файлов
+			if entry.IsDir() {
+				colorCode = "34" // синий для директорий
+			}
+
+			line := fmt.Sprintf("%s%s %s %s %s", fileType, perms, modTime, size, name)
+			coloredLine := fmt.Sprintf("\033[%sm%s\033[0m", colorCode, line)
+			segments = append(segments, parseANSI(coloredLine, tcell.StyleDefault)...)
+		} else {
+			// Простой формат
+			if entry.IsDir() {
+				// Директории отображаем синим цветом
+				coloredName := fmt.Sprintf("\033[34m%s\033[0m", name)
+				segments = append(segments, parseANSI(coloredName, tcell.StyleDefault)...)
+			} else {
+				// Файлы отображаем белым цветом
+				segments = append(segments, LineSegment{
+					Text:  name,
+					Style: tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorDefault),
+				})
+			}
+		}
+
+		// Добавляем перевод строки между элементами в подробном формате
+		if longFormat {
+			segments = append(segments, LineSegment{
+				Text:  "\n",
+				Style: tcell.StyleDefault,
+			})
+		} else {
+			// В простом формате добавляем пробел между файлами
+			segments = append(segments, LineSegment{
+				Text:  "  ",
+				Style: tcell.StyleDefault,
+			})
+		}
+	}
+
+	// Убираем последний пробел или перевод строки
+	if len(segments) > 0 {
+		segments = segments[:len(segments)-1]
+	}
+
+	return segments
+}
+
+func (t *Terminal) processDateCommand() []LineSegment {
+	// Получаем текущую дату и время
+	currentTime := time.Now()
+
+	// Форматируем дату и время
+	// Формат: день недели, месяц, день, год, время
+	dateText := currentTime.Format("Mon Jan 2 15:04:05 MST 2006")
+
+	return parseANSI(dateText, tcell.StyleDefault.
+		Foreground(tcell.ColorYellow).
+		Background(tcell.ColorDefault))
+}
+
+func (t *Terminal) processWhoamiCommand() []LineSegment {
+	// Получаем информацию о текущем пользователе
+	currentUser, err := user.Current()
+	if err != nil {
+		errorMsg := fmt.Sprintf("\033[31mError: %s\033[0m", err)
+		return parseANSI(errorMsg, tcell.StyleDefault)
+	}
+
+	return parseANSI(currentUser.Username, tcell.StyleDefault.
+		Foreground(tcell.ColorGreen).
+		Background(tcell.ColorDefault))
+}
 
 func (t *Terminal) processSystemCommand(args []string) []LineSegment {
 	cmd := exec.Command(args[0], args[1:]...)
