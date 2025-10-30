@@ -14,6 +14,7 @@ import (
     "github.com/gdamore/tcell/v2"
     "golang.org/x/text/encoding/charmap"
     "golang.org/x/text/transform"
+    "github.com/creack/pty"
 )
 
 type Terminal struct {
@@ -25,6 +26,10 @@ type Terminal struct {
 	outputLines   []LineSegment // Храним вывод команд с цветами
 	history       []string      // История команд
 	historyPos    int           // Позиция в истории
+	ptmx        *os.File
+	cmd         *exec.Cmd
+	inPtyMode   bool
+	scrollOffset int
 }
 
 // LineSegment представляет сегмент текста с определенным стилем
@@ -71,7 +76,35 @@ var ansiBgColors = map[int]tcell.Color{
 	106: tcell.ColorTeal,
 	107: tcell.ColorWhite,
 }
-
+func (t *Terminal) processPtyCommand(args []string) []LineSegment {
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
+	
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка PTY: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+	
+	t.ptmx = ptmx
+	t.cmd = cmd
+	t.inPtyMode = true
+	
+	// Чтение вывода в фоне
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := ptmx.Read(buf)
+			if err != nil {
+				break
+			}
+			output := string(buf[:n])
+			t.addColoredOutput(output, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+		}
+		t.inPtyMode = false
+	}()
+	
+	return []LineSegment{{Text: "Запущена интерактивная команда...", Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
+}
 func main() {
 	os.Setenv("LANG", "en_US.UTF-8")
 	os.Setenv("LC_ALL", "en_US.UTF-8")
@@ -154,10 +187,10 @@ func (t *Terminal) updateCursorBlink() {
 func (t *Terminal) draw() {
     width, height := t.screen.Size()
 
-    offsetX := width / 4
-    offsetY := height / 4
-    termWidth := width - 2*offsetX
-    termHeight := height - 2*offsetY
+    offsetX := 2
+    offsetY := 2
+    termWidth := width - 4*offsetX
+    termHeight := height - 4*offsetY
 
     t.screen.Clear()
     t.drawTerminalArea(offsetX, offsetY, termWidth, termHeight)
@@ -197,7 +230,13 @@ func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
 	availableHeight := height
 	currentY := offsetY
 
-	for i := 0; i < len(t.outputLines) && currentY < offsetY+availableHeight; i++ {
+	// Пропускаем строки согласно прокрутке
+	startIndex := 0
+	if t.scrollOffset > 0 && t.scrollOffset < len(t.outputLines) {
+		startIndex = t.scrollOffset
+	}
+
+	for i := startIndex; i < len(t.outputLines) && currentY < offsetY+availableHeight; i++ {
 		segment := t.outputLines[i]
 		text := segment.Text
 		runes := []rune(text)
@@ -211,7 +250,10 @@ func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
 		// Разбиваем длинные строки на несколько строк
 		for len(runes) > 0 && currentY < offsetY+availableHeight {
 			// Берем столько символов, сколько влезает в ширину
-			take := min(len(runes), width)
+			take := len(runes)
+			if width < take {
+				take = width
+			}
 			line := string(runes[:take])
 			t.drawText(offsetX, currentY, line, segment.Style)
 			
@@ -680,26 +722,55 @@ func (t *Terminal) processWhoamiCommand() []LineSegment {
 }
 
 func (t *Terminal) processSystemCommand(args []string) []LineSegment {
-	cmd := exec.Command(args[0], args[1:]...)
+	// Для интерактивных команд используем PTY
+	interactiveCommands := map[string]bool{
+		"vim": true, "vi": true, "nano": true, "top": true, 
+		"htop": true, "less": true, "more": true, "man": true,
+	}
 	
-	// Устанавливаем UTF-8 кодировку для вывода
+	if interactiveCommands[args[0]] {
+		return t.processPtyCommand(args)
+	}
+	
+	// Для обычных команд оставляем как было
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
 	
 	output, err := cmd.CombinedOutput()
-
 	if err != nil {
 		errorMsg := fmt.Sprintf("Ошибка: %s", err)
 		return []LineSegment{{Text: errorMsg, Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
-	} else {
-		// Вывод как есть - предполагаем что tcell поддерживает UTF-8
-		return []LineSegment{{
-			Text:  string(output),
-			Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
-		}}
 	}
+	
+	return []LineSegment{{
+		Text:  string(output),
+		Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
+	}}
 }
 
 func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
+	// Если в режиме PTY, передаем ввод в команду
+	if t.inPtyMode && t.ptmx != nil {
+		switch ev.Key() {
+		case tcell.KeyEscape:
+			if ev.Modifiers() == tcell.ModCtrl {
+				// Ctrl+C для выхода из PTY режима
+				t.cmd.Process.Signal(os.Interrupt)
+				t.inPtyMode = false
+				return
+			}
+			t.ptmx.Write([]byte{0x1b}) // ESC
+		case tcell.KeyEnter:
+			t.ptmx.Write([]byte{'\r'})
+		case tcell.KeyBackspace, tcell.KeyBackspace2:
+			t.ptmx.Write([]byte{'\b'})
+		case tcell.KeyTab:
+			t.ptmx.Write([]byte{'\t'})
+		case tcell.KeyRune:
+			t.ptmx.Write([]byte(string(ev.Rune())))
+		}
+		return
+	}
 	switch ev.Key() {
 	case tcell.KeyEscape, tcell.KeyCtrlC:
 		t.screen.Fini()
@@ -728,7 +799,11 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 			t.inputBuffer = make([]rune, 0)
 			t.cursorPos = 0
 		}
-
+	// Добавьте в switch-case в handleKeyEvent:
+	case tcell.KeyPgUp:
+		t.scrollOffset += 5
+	case tcell.KeyPgDn:
+		t.scrollOffset = max(0, t.scrollOffset-5)
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if t.cursorPos > 0 && len(t.inputBuffer) > 0 {
 			t.inputBuffer = append(t.inputBuffer[:t.cursorPos-1], t.inputBuffer[t.cursorPos:]...)
@@ -764,6 +839,12 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 	}
 }
 
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
 func (t *Terminal) insertRune(r rune) {
     // Вставляем руну правильно
     if t.cursorPos == len(t.inputBuffer) {
