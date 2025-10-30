@@ -1,15 +1,19 @@
 package main
 
 import (
-	"fmt"
-	"os"
-	"os/exec"
-	"os/user"
-	"regexp"
-	"strings"
-	"time"
+    "bytes"
+    "fmt"
+    "io"
+    "os"
+    "os/exec"
+    "os/user"
+    "regexp"
+    "strings"
+    "time"
 
-	"github.com/gdamore/tcell/v2"
+    "github.com/gdamore/tcell/v2"
+    "golang.org/x/text/encoding/charmap"
+    "golang.org/x/text/transform"
 )
 
 type Terminal struct {
@@ -69,6 +73,8 @@ var ansiBgColors = map[int]tcell.Color{
 }
 
 func main() {
+	os.Setenv("LANG", "en_US.UTF-8")
+	os.Setenv("LC_ALL", "en_US.UTF-8")
 	// Инициализация экрана
 	s, err := tcell.NewScreen()
 	if err != nil {
@@ -128,7 +134,16 @@ func main() {
 		}
 	}
 }
-
+func decodeWindows1251(data []byte) string {
+    // Пробуем декодировать из Windows-1251 (часто используется в Windows)
+    reader := transform.NewReader(bytes.NewReader(data), charmap.Windows1251.NewDecoder())
+    decoded, err := io.ReadAll(reader)
+    if err != nil {
+        // Если не получается, возвращаем как есть
+        return string(data)
+    }
+    return string(decoded)
+}
 func (t *Terminal) updateCursorBlink() {
 	if time.Since(t.lastBlink) > 500*time.Millisecond {
 		t.cursorVisible = !t.cursorVisible
@@ -137,37 +152,33 @@ func (t *Terminal) updateCursorBlink() {
 }
 
 func (t *Terminal) draw() {
-	width, height := t.screen.Size()
+    width, height := t.screen.Size()
 
-	// Вычисляем отступы 25%
-	offsetX := width / 4
-	offsetY := height / 4
-	termWidth := width - 2*offsetX
-	termHeight := height - 2*offsetY
+    offsetX := width / 4
+    offsetY := height / 4
+    termWidth := width - 2*offsetX
+    termHeight := height - 2*offsetY
 
-	// Очищаем экран
-	t.screen.Clear()
+    t.screen.Clear()
+    t.drawTerminalArea(offsetX, offsetY, termWidth, termHeight)
 
-	// Рисуем темный прямоугольник терминала
-	t.drawTerminalArea(offsetX, offsetY, termWidth, termHeight)
+    inputY := offsetY + 1
+    inputLine := "> " + string(t.inputBuffer)
 
-	// Позиция курсора и ввода - ВСЕГДА ВВЕРХУ
-	inputY := offsetY + 1
-	inputLine := "> " + string(t.inputBuffer)
+    t.drawOutput(offsetX, inputY+1, termWidth, termHeight-2)
 
-	// Рисуем вывод команд - ВСЕ строки, начиная сверху
-	t.drawOutput(offsetX, inputY+1, termWidth, termHeight-2)
+    // Рисуем текст
+    t.drawText(offsetX, inputY, inputLine, tcell.StyleDefault.
+        Foreground(tcell.ColorWhite).
+        Background(tcell.ColorDefault))
 
-	// Затем рисуем строку ввода ПОВЕРХ всего (она всегда на одном месте)
-	t.drawText(offsetX, inputY, inputLine, tcell.StyleDefault.
-		Foreground(tcell.ColorWhite).
-		Background(tcell.ColorDefault))
-
-	// И курсор поверх всего
-	if t.cursorVisible {
-		cursorX := offsetX + len("> ") + t.cursorPos
-		t.drawCursor(cursorX, inputY)
-	}
+    // Курсор - правильное вычисление позиции для кириллицы
+    prefix := "> "
+    cursorX := offsetX + len([]rune(prefix)) + t.cursorPos // Используем руны для префикса
+    
+    if t.cursorVisible {
+        t.drawCursor(cursorX, inputY)
+    }
 }
 
 func (t *Terminal) drawTerminalArea(x, y, width, height int) {
@@ -183,38 +194,55 @@ func (t *Terminal) drawTerminalArea(x, y, width, height int) {
 }
 
 func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
-	// Вычисляем, сколько строк вывода мы можем показать
 	availableHeight := height
+	currentY := offsetY
 
-	// Показываем ВСЕ строки начиная с offsetY, даже если они выходят за границы
-	// Старые команды просто уходят вниз за пределы экрана
-	for i := 0; i < len(t.outputLines); i++ {
-		// Если строка выходит за нижнюю границу - пропускаем ее
-		if offsetY+i >= offsetY+availableHeight {
-			continue // Эта строка уже за пределами видимой области
-		}
-
+	for i := 0; i < len(t.outputLines) && currentY < offsetY+availableHeight; i++ {
 		segment := t.outputLines[i]
-		// Обрезаем строку если она слишком длинная
 		text := segment.Text
-		if len(text) > width {
-			text = text[:width]
+		runes := []rune(text)
+		
+		// Если строка пустая, просто переходим на следующую строку
+		if len(runes) == 0 {
+			currentY++
+			continue
 		}
-		t.drawText(offsetX, offsetY+i, text, segment.Style)
+
+		// Разбиваем длинные строки на несколько строк
+		for len(runes) > 0 && currentY < offsetY+availableHeight {
+			// Берем столько символов, сколько влезает в ширину
+			take := min(len(runes), width)
+			line := string(runes[:take])
+			t.drawText(offsetX, currentY, line, segment.Style)
+			
+			// Убираем обработанную часть
+			runes = runes[take:]
+			currentY++
+		}
 	}
+}
+
+// Вспомогательная функция для min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (t *Terminal) drawText(x, y int, text string, style tcell.Style) {
-	for i, ch := range text {
-		t.screen.SetContent(x+i, y, ch, nil, style)
-	}
+    runes := []rune(text) // Правильно преобразуем в руны
+    for i, r := range runes {
+        t.screen.SetContent(x+i, y, r, nil, style)
+    }
 }
 
 func (t *Terminal) drawCursor(x, y int) {
-	style := tcell.StyleDefault.
-		Foreground(tcell.ColorBlack).
-		Background(tcell.ColorWhite)
-	t.screen.SetContent(x, y, ' ', nil, style)
+    style := tcell.StyleDefault.
+        Foreground(tcell.ColorBlack).
+        Background(tcell.ColorWhite)
+    // Используем пробел для курсора вместо символа
+    t.screen.SetContent(x, y, ' ', nil, style)
 }
 
 // parseANSI преобразует строку с ANSI кодами в сегменты с правильными стилями
@@ -363,7 +391,11 @@ func (t *Terminal) addColoredOutput(text string, baseStyle tcell.Style) {
 	for _, segment := range segments {
 		// Разбиваем на строки если есть переносы
 		lines := strings.Split(segment.Text, "\n")
-		for _, line := range lines {
+		for i, line := range lines {
+			if i > 0 {
+				// Добавляем явный перенос строки между частями
+				t.outputLines = append(t.outputLines, LineSegment{Text: "\n", Style: segment.Style})
+			}
 			t.outputLines = append(t.outputLines, LineSegment{Text: line, Style: segment.Style})
 		}
 	}
@@ -398,7 +430,6 @@ func (t *Terminal) executeCommand(cmd string) {
 	t.history = append(t.history, cmd)
 	t.historyPos = len(t.history)
 }
-
 func (t *Terminal) processCommand(cmd string) []LineSegment {
 	args := strings.Fields(cmd)
 	if len(args) == 0 {
@@ -459,6 +490,74 @@ func (t *Terminal) processCommand(cmd string) []LineSegment {
 
 	return segments
 }
+func (t *Terminal) processLsCommand(args []string) []LineSegment {
+	dir := "."
+	longFormat := false
+	showHidden := false
+	onePerLine := false
+
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "-l" {
+			longFormat = true
+		} else if arg == "-a" {
+			showHidden = true
+		} else if arg == "-1" {
+			onePerLine = true
+		} else if arg == "-la" || arg == "-al" {
+			longFormat = true
+			showHidden = true
+		} else if !strings.HasPrefix(arg, "-") {
+			dir = arg
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return []LineSegment{{Text: "Error reading directory", Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	var validEntries []os.DirEntry
+	for _, entry := range entries {
+		if !showHidden && strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		validEntries = append(validEntries, entry)
+	}
+
+	// Для -1 или -l - каждый элемент на отдельной строке
+	if onePerLine || longFormat {
+		var result []LineSegment
+		for _, entry := range validEntries { // Убрали i, так как он не используется
+			var line string
+			if longFormat {
+				info, err := entry.Info()
+				if err != nil {
+					continue
+				}
+				fileType := "-"
+				if entry.IsDir() {
+					fileType = "d"
+				}
+				line = fmt.Sprintf("%s %8d %s %s", fileType, info.Size(), info.ModTime().Format("Jan 02 15:04"), entry.Name())
+			} else {
+				line = entry.Name()
+			}
+			
+			// Каждая строка - отдельный сегмент
+			result = append(result, LineSegment{Text: line, Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)})
+		}
+		return result
+	} else {
+		// Обычный ls - все в одну строку
+		var names []string
+		for _, entry := range validEntries {
+			names = append(names, entry.Name())
+		}
+		combined := strings.Join(names, "  ")
+		return []LineSegment{{Text: combined, Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)}}
+	}
+}
 
 func (t *Terminal) processColorDemo() []LineSegment {
 	colors := []struct {
@@ -494,24 +593,28 @@ func (t *Terminal) processColorDemo() []LineSegment {
 
 func (t *Terminal) processHelpCommand() []LineSegment {
 	helpText := `Доступные команды:
-	 exit, quit    - Выйти из терминала
-	 clear         - Очистить экран
-	 echo <text>   - Вывести текст
-	 pwd           - Показать текущую директорию
-	 time          - Показать текущее время
-	 date          - Показать текущую дату
-	 whoami        - Показать имя текущего пользователя
-	 history       - Показать историю команд
-	 ls            - Показать содержимое директории
-	 cd <dir>      - Перейти в директорию
-	 colors        - Демонстрация цветов
-	 help          - Показать это сообщение
-	 run <cmd>     - Выполнить системную команду
-	 <cmd>         - Выполнить системную команду напрямую`
+  exit, quit    - Выйти из терминала
+  clear         - Очистить экран
+  echo <текст>  - Вывести текст
+  pwd           - Показать текущую директорию
+  time          - Показать текущее время
+  date          - Показать текущую дату
+  whoami        - Показать имя текущего пользователя
+  history       - Показать историю команд
+  ls [опции]    - Показать содержимое директории
+                -l: подробный формат
+                -a: показать скрытые файлы
+                -1: по одному файлу на строку
+  cd <директория> - Перейти в директорию
+  colors        - Демонстрация цветов
+  help          - Показать это сообщение
+  run <команда> - Выполнить системную команду
+  <команда>     - Выполнить системную команду напрямую`
 
-	return parseANSI(helpText, tcell.StyleDefault.
-		Foreground(tcell.ColorWhite).
-		Background(tcell.ColorDefault))
+	return []LineSegment{{
+		Text:  helpText,
+		Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
+	}}
 }
 
 func (t *Terminal) processHistoryCommand() []LineSegment {
@@ -531,127 +634,24 @@ func (t *Terminal) processHistoryCommand() []LineSegment {
 
 func (t *Terminal) processCdCommand(args []string) []LineSegment {
 	if len(args) < 2 {
-		// Если не указана директория, переходим в домашнюю директорию
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
-			errorMsg := fmt.Sprintf("\033[31mError: %s\033[0m", err)
-			return parseANSI(errorMsg, tcell.StyleDefault)
+			errorMsg := fmt.Sprintf("Ошибка: %s", err)
+			return []LineSegment{{Text: errorMsg, Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 		}
 		args = []string{"cd", homeDir}
 	}
 
-	// Меняем директорию
 	err := os.Chdir(args[1])
 	if err != nil {
-		errorMsg := fmt.Sprintf("\033[31mError: %s\033[0m", err)
-		return parseANSI(errorMsg, tcell.StyleDefault)
-	}
-
-	// Возвращаем пустой сегмент, так как команда cd не должна выводить ничего
-	return []LineSegment{}
-}
-
-func (t *Terminal) processLsCommand(args []string) []LineSegment {
-	// По умолчанию показываем содержимое текущей директории
-	dir := "."
-	longFormat := false
-	showHidden := false
-	onePerLine := false
-
-	// Обрабатываем аргументы
-	for i := 1; i < len(args); i++ {
-		arg := args[i]
-		if arg == "-l" {
-			longFormat = true
-		} else if arg == "-a" {
-			showHidden = true
-		} else if arg == "-1" {
-			onePerLine = true
-		} else if arg == "-la" || arg == "-al" {
-			longFormat = true
-			showHidden = true
-		} else if !strings.HasPrefix(arg, "-") {
-			// Это путь к директории
-			dir = arg
-		}
-	}
-
-	// Получаем список файлов в директории
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		errorMsg := fmt.Sprintf("Error: %s", err)
+		errorMsg := fmt.Sprintf("Ошибка: %s", err)
 		return []LineSegment{{Text: errorMsg, Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	}
 
-	// Фильтруем скрытые файлы
-	var filteredEntries []os.DirEntry
-	for _, entry := range entries {
-		if !showHidden && strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-		filteredEntries = append(filteredEntries, entry)
-	}
-
-	// Для подробного формата или -1 - каждый элемент на новой строке
-	if longFormat || onePerLine {
-		var segments []LineSegment
-		
-		for i, entry := range filteredEntries {
-			if longFormat {
-				// Подробный формат
-				info, err := entry.Info()
-				if err != nil {
-					continue
-				}
-
-				fileType := "-"
-				if entry.IsDir() {
-					fileType = "d"
-				}
-
-				size := info.Size()
-				modTime := info.ModTime().Format("Jan 02 15:04")
-
-				line := fmt.Sprintf("%s %8d %s %s", fileType, size, modTime, entry.Name())
-				segments = append(segments, LineSegment{
-					Text:  line,
-					Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
-				})
-			} else {
-				// Простой формат с одной записью на строку (-1)
-				segments = append(segments, LineSegment{
-					Text:  entry.Name(),
-					Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
-				})
-			}
-
-			// Добавляем перевод строки после каждого элемента (кроме последнего)
-			if i < len(filteredEntries)-1 {
-				segments = append(segments, LineSegment{
-					Text:  "\n",
-					Style: tcell.StyleDefault,
-				})
-			}
-		}
-
-		return segments
-	} else {
-		// Обычный формат - все в одну строку с пробелами
-		var names []string
-		for _, entry := range filteredEntries {
-			names = append(names, entry.Name())
-		}
-		
-		// Объединяем все имена в одну строку
-		combined := strings.Join(names, "  ")
-		
-		// Возвращаем как ОДИН сегмент
-		return []LineSegment{{
-			Text:  combined,
-			Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
-		}}
-	}
+	return []LineSegment{}
 }
+
+
 
 func (t *Terminal) processDateCommand() []LineSegment {
 	// Получаем текущую дату и время
@@ -681,13 +681,21 @@ func (t *Terminal) processWhoamiCommand() []LineSegment {
 
 func (t *Terminal) processSystemCommand(args []string) []LineSegment {
 	cmd := exec.Command(args[0], args[1:]...)
+	
+	// Устанавливаем UTF-8 кодировку для вывода
+	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
+	
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		errorMsg := fmt.Sprintf("\033[31mError: %s\033[0m", err)
-		return parseANSI(errorMsg, tcell.StyleDefault)
+		errorMsg := fmt.Sprintf("Ошибка: %s", err)
+		return []LineSegment{{Text: errorMsg, Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	} else {
-		return parseANSI(string(output), tcell.StyleDefault)
+		// Вывод как есть - предполагаем что tcell поддерживает UTF-8
+		return []LineSegment{{
+			Text:  string(output),
+			Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
+		}}
 	}
 }
 
@@ -757,11 +765,11 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 }
 
 func (t *Terminal) insertRune(r rune) {
-	if t.cursorPos == len(t.inputBuffer) {
-		t.inputBuffer = append(t.inputBuffer, r)
-	} else {
-		t.inputBuffer = append(t.inputBuffer[:t.cursorPos+1], t.inputBuffer[t.cursorPos:]...)
-		t.inputBuffer[t.cursorPos] = r
-	}
-	t.cursorPos++
+    // Вставляем руну правильно
+    if t.cursorPos == len(t.inputBuffer) {
+        t.inputBuffer = append(t.inputBuffer, r)
+    } else {
+        t.inputBuffer = append(t.inputBuffer[:t.cursorPos], append([]rune{r}, t.inputBuffer[t.cursorPos:]...)...)
+    }
+    t.cursorPos++
 }
