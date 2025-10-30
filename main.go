@@ -556,6 +556,7 @@ func (t *Terminal) processLsCommand(args []string) []LineSegment {
 	dir := "."
 	longFormat := false
 	showHidden := false
+	onePerLine := false
 
 	// Обрабатываем аргументы
 	for i := 1; i < len(args); i++ {
@@ -564,6 +565,8 @@ func (t *Terminal) processLsCommand(args []string) []LineSegment {
 			longFormat = true
 		} else if arg == "-a" {
 			showHidden = true
+		} else if arg == "-1" {
+			onePerLine = true
 		} else if arg == "-la" || arg == "-al" {
 			longFormat = true
 			showHidden = true
@@ -576,88 +579,78 @@ func (t *Terminal) processLsCommand(args []string) []LineSegment {
 	// Получаем список файлов в директории
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		errorMsg := fmt.Sprintf("\033[31mError: %s\033[0m", err)
-		return parseANSI(errorMsg, tcell.StyleDefault)
+		errorMsg := fmt.Sprintf("Error: %s", err)
+		return []LineSegment{{Text: errorMsg, Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	}
 
-	var segments []LineSegment
-
-	// Отображаем содержимое директории
+	// Фильтруем скрытые файлы
+	var filteredEntries []os.DirEntry
 	for _, entry := range entries {
-		name := entry.Name()
-
-		// Пропускаем скрытые файлы, если не указан флаг -a
-		if !showHidden && strings.HasPrefix(name, ".") {
+		if !showHidden && strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
+		filteredEntries = append(filteredEntries, entry)
+	}
 
-		if longFormat {
-			// Подробный формат
-			info, err := entry.Info()
-			if err != nil {
-				continue
-			}
+	// Для подробного формата или -1 - каждый элемент на новой строке
+	if longFormat || onePerLine {
+		var segments []LineSegment
+		
+		for i, entry := range filteredEntries {
+			if longFormat {
+				// Подробный формат
+				info, err := entry.Info()
+				if err != nil {
+					continue
+				}
 
-			// Определяем тип файла
-			fileType := "-"
-			if entry.IsDir() {
-				fileType = "d"
-			}
+				fileType := "-"
+				if entry.IsDir() {
+					fileType = "d"
+				}
 
-			// Права доступа (упрощенно)
-			perms := "rwxr-xr-x"
+				size := info.Size()
+				modTime := info.ModTime().Format("Jan 02 15:04")
 
-			// Размер файла
-			size := info.Size()
-
-			// Время модификации
-			modTime := info.ModTime().Format("Jan 02 15:04")
-
-			// Цвет для директорий
-			colorCode := "37" // белый для файлов
-			if entry.IsDir() {
-				colorCode = "34" // синий для директорий
-			}
-
-			line := fmt.Sprintf("%s%s %s %s %s", fileType, perms, modTime, size, name)
-			coloredLine := fmt.Sprintf("\033[%sm%s\033[0m", colorCode, line)
-			segments = append(segments, parseANSI(coloredLine, tcell.StyleDefault)...)
-		} else {
-			// Простой формат
-			if entry.IsDir() {
-				// Директории отображаем синим цветом
-				coloredName := fmt.Sprintf("\033[34m%s\033[0m", name)
-				segments = append(segments, parseANSI(coloredName, tcell.StyleDefault)...)
-			} else {
-				// Файлы отображаем белым цветом
+				line := fmt.Sprintf("%s %8d %s %s", fileType, size, modTime, entry.Name())
 				segments = append(segments, LineSegment{
-					Text:  name,
-					Style: tcell.StyleDefault.Foreground(tcell.ColorWhite).Background(tcell.ColorDefault),
+					Text:  line,
+					Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
+				})
+			} else {
+				// Простой формат с одной записью на строку (-1)
+				segments = append(segments, LineSegment{
+					Text:  entry.Name(),
+					Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
+				})
+			}
+
+			// Добавляем перевод строки после каждого элемента (кроме последнего)
+			if i < len(filteredEntries)-1 {
+				segments = append(segments, LineSegment{
+					Text:  "\n",
+					Style: tcell.StyleDefault,
 				})
 			}
 		}
 
-		// Добавляем перевод строки между элементами в подробном формате
-		if longFormat {
-			segments = append(segments, LineSegment{
-				Text:  "\n",
-				Style: tcell.StyleDefault,
-			})
-		} else {
-			// В простом формате добавляем пробел между файлами
-			segments = append(segments, LineSegment{
-				Text:  "  ",
-				Style: tcell.StyleDefault,
-			})
+		return segments
+	} else {
+		// Обычный формат - все в одну строку с пробелами
+		var names []string
+		for _, entry := range filteredEntries {
+			names = append(names, entry.Name())
 		}
+		
+		// Объединяем все имена в одну строку
+		combined := strings.Join(names, "  ")
+		
+		// Возвращаем как ОДИН сегмент
+		return []LineSegment{{
+			Text:  combined,
+			Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
+		}}
 	}
-
-	// Убираем последний пробел или перевод строки
-	if len(segments) > 0 {
-		segments = segments[:len(segments)-1]
-	}
-
-	return segments
 }
 
 func (t *Terminal) processDateCommand() []LineSegment {
