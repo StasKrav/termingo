@@ -634,29 +634,113 @@ func (t *Terminal) processColorDemo() []LineSegment {
 }
 
 func (t *Terminal) processHelpCommand() []LineSegment {
-	helpText := `Доступные команды:
-  exit, quit    - Выйти из терминала
-  clear         - Очистить экран
-  echo <текст>  - Вывести текст
-  pwd           - Показать текущую директорию
-  time          - Показать текущее время
-  date          - Показать текущую дату
-  whoami        - Показать имя текущего пользователя
-  history       - Показать историю команд
-  ls [опции]    - Показать содержимое директории
-                -l: подробный формат
-                -a: показать скрытые файлы
-                -1: по одному файлу на строку
-  cd <директория> - Перейти в директорию
-  colors        - Демонстрация цветов
-  help          - Показать это сообщение
-  run <команда> - Выполнить системную команду
-  <команда>     - Выполнить системную команду напрямую`
+    // Стили
+    titleStyle := tcell.StyleDefault.Foreground(tcell.ColorTeal).Bold(true)
+    commandStyle := tcell.StyleDefault.Foreground(tcell.ColorGreen)
+    descStyle := tcell.StyleDefault.Foreground(tcell.ColorWhite)
+    optionStyle := tcell.StyleDefault.Foreground(tcell.ColorYellow)
+    
+    // Сначала формируем весь текст
+    var output strings.Builder
+    
+    // Заголовок
+    output.WriteString("Доступные команды:\n\n")
+    
+    // Команды с выравниванием
+    commands := []struct {
+        cmd  string
+        desc string
+    }{
+        {"exit, quit", "Выйти из терминала"},
+        {"clear", "Очистить экран"},
+        {"echo <текст>", "Вывести текст"},
+        {"pwd", "Показать текущую директорию"},
+        {"time", "Показать текущее время"},
+        {"date", "Показать текущую дату"},
+        {"whoami", "Показать имя текущего пользователя"},
+        {"history", "Показать историю команд"},
+        {"ls [опции]", "Показать содержимое директории"},
+        {"cd <директория>", "Перейти в директорию"},
+        {"colors", "Демонстрация цветов"},
+        {"help", "Показать это сообщение"},
+        {"run <команда>", "Выполнить системную команду"},
+        {"<команда>", "Выполнить системную команду напрямую"},
+    }
+    
+    // Находим максимальную длину команд для выравнивания
+    maxLen := 0
+    for _, cmd := range commands {
+        if len(cmd.cmd) > maxLen {
+            maxLen = len(cmd.cmd)
+        }
+    }
+    
+    // Формируем выровненные строки
+    for _, cmd := range commands {
+        padding := strings.Repeat(" ", maxLen - len(cmd.cmd))
+        output.WriteString("  " + cmd.cmd + padding + "  - " + cmd.desc + "\n")
+    }
+    
+    // Опции для ls
+    output.WriteString("\n  Опции для ls:\n")
+    options := []struct {
+        opt  string
+        desc string
+    }{
+        {"-l", "подробный формат"},
+        {"-a", "показать скрытые файлы"},
+        {"-1", "по одному файлу на строку"},
+    }
+    
+    for _, opt := range options {
+        output.WriteString("    " + opt.opt + " - " + opt.desc + "\n")
+    }
+    
+    // Теперь разбиваем на строки и применяем стили
+    lines := strings.Split(output.String(), "\n")
+    var segments []LineSegment
+    
+    for _, line := range lines {
+        if strings.Contains(line, "Доступные команды:") {
+            segments = append(segments, LineSegment{Text: line, Style: titleStyle})
+        } else if strings.Contains(line, "Опции для ls:") {
+            segments = append(segments, LineSegment{Text: line, Style: descStyle})
+        } else {
+            // Разбираем строку на части для раскраски
+            segments = append(segments, t.colorizeHelpLine(line, commandStyle, descStyle, optionStyle))
+        }
+    }
+    
+    return segments
+}
 
-	return []LineSegment{{
-		Text:  helpText,
-		Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
-	}}
+func (t *Terminal) colorizeHelpLine(line string, cmdStyle, descStyle, optStyle tcell.Style) LineSegment {
+    // Простая логика раскраски - если строка начинается с команд, раскрашиваем их
+    if strings.HasPrefix(line, "  ") && len(line) > 2 {
+        // Ищем разделитель " - "
+        if idx := strings.Index(line, " - "); idx != -1 {
+            commandPart := line[:idx]
+            descPart := line[idx:]
+            
+            // Проверяем, является ли это опцией ls (имеет отступ 4 пробела)
+            if strings.HasPrefix(line, "    ") && len(line) > 4 {
+                // Это опция - раскрашиваем флаг
+                if flagIdx := strings.Index(line, " - "); flagIdx != -1 {
+                    flagPart := line[4:flagIdx]
+                    restPart := line[flagIdx:]
+                    coloredLine := flagPart + restPart
+                    return LineSegment{Text: coloredLine, Style: optStyle}
+                }
+            } else {
+                // Это обычная команда
+                coloredLine := commandPart + descPart
+                return LineSegment{Text: coloredLine, Style: cmdStyle}
+            }
+        }
+    }
+    
+    // По умолчанию - обычный текст
+    return LineSegment{Text: line, Style: descStyle}
 }
 
 func (t *Terminal) processHistoryCommand() []LineSegment {
