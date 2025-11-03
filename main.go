@@ -1048,11 +1048,15 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		if t.cursorPos > 0 && len(t.inputBuffer) > 0 {
 			t.inputBuffer = append(t.inputBuffer[:t.cursorPos-1], t.inputBuffer[t.cursorPos:]...)
 			t.cursorPos--
+			// Обновляем список автодополнения после удаления символа
+			t.updateCompletionList()
 		}
 
 	case tcell.KeyDelete:
 		if t.cursorPos < len(t.inputBuffer) {
 			t.inputBuffer = append(t.inputBuffer[:t.cursorPos], t.inputBuffer[t.cursorPos+1:]...)
+			// Обновляем список автодополнения после удаления символа
+			t.updateCompletionList()
 		}
 
 	case tcell.KeyLeft:
@@ -1081,10 +1085,9 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		}
 
 	case tcell.KeyRune:
-		// При вводе нового символа сбрасываем совпадения автодополнения
-		t.completionMatches = []string{}
-		t.completionIndex = 0
+		// При вводе нового символа обновляем список автодополнения
 		t.insertRune(ev.Rune())
+		t.updateCompletionList()
 
 	default:
 		// Игнорируем другие клавиши
@@ -1202,4 +1205,24 @@ func (t *Terminal) cycleCompletion() {
 	currentMatch := t.completionMatches[t.completionIndex]
 	t.inputBuffer = []rune(currentMatch)
 	t.cursorPos = len(t.inputBuffer)
+}
+
+// updateCompletionList обновляет список вариантов автодополнения на основе текущего ввода
+func (t *Terminal) updateCompletionList() {
+	// Находим все совпадения
+	matches := t.findCompletionMatches()
+
+	// Сохраняем совпадения
+	t.completionMatches = matches
+
+	// Если есть совпадения, устанавливаем индекс на первое совпадение
+	if len(matches) > 0 {
+		t.completionIndex = 0
+	} else {
+		// Если совпадений нет, сбрасываем индекс
+		t.completionIndex = 0
+	}
+
+	// Сбрасываем смещение скролла
+	t.completionScrollOffset = 0
 }
