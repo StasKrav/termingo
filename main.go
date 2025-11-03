@@ -147,13 +147,28 @@ func main() {
 		term.zshHistory = zshHistory
 	}
 
-	// Загружаем алиасы
+	// Загружаем алиасы из .zshrc
+	zshAliases, err := loadZshAliases()
+	if err != nil {
+		// В случае ошибки продолжаем работу без алиасов из .zshrc
+		fmt.Printf("Предупреждение: не удалось загрузить алиасы из .zshrc: %v\n", err)
+	} else {
+		// Копируем алиасы из .zshrc в терминал
+		for alias, command := range zshAliases {
+			term.aliases[alias] = command
+		}
+	}
+
+	// Загружаем алиасы из .termgo_aliases (они будут иметь приоритет)
 	aliases, err := loadAliases()
 	if err != nil {
-		// В случае ошибки продолжаем работу без алиасов
-		fmt.Printf("Предупреждение: не удалось загрузить алиасы: %v\n", err)
+		// В случае ошибки продолжаем работу без алиасов из .termgo_aliases
+		fmt.Printf("Предупреждение: не удалось загрузить алиасы из .termgo_aliases: %v\n", err)
 	} else {
-		term.aliases = aliases
+		// Копируем алиасы из .termgo_aliases в терминал (они перезапишут алиасы из .zshrc)
+		for alias, command := range aliases {
+			term.aliases[alias] = command
+		}
 	}
 
 	// Устанавливаем темный стиль
@@ -273,6 +288,57 @@ func (t *Terminal) saveAliases() error {
 	}
 
 	return writer.Flush()
+}
+
+// loadZshAliases загружает алиасы из файла ~/.zshrc
+func loadZshAliases() (map[string]string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	zshrcPath := homeDir + "/.zshrc"
+	file, err := os.Open(zshrcPath)
+	if err != nil {
+		// Если файл не найден, возвращаем пустую карту алиасов
+		if os.IsNotExist(err) {
+			return make(map[string]string), nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	aliases := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+
+	// Регулярное выражение для извлечения алиасов из формата zshrc
+	// Формат: alias имя=команда или alias имя="команда" или alias имя='команда'
+	re := regexp.MustCompile(`^alias\s+([^=]+)=(.*)$`)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Пропускаем пустые строки и комментарии
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		matches := re.FindStringSubmatch(line)
+		if len(matches) > 2 {
+			alias := matches[1]
+			command := matches[2]
+
+			// Убираем кавычки если есть
+			command = strings.Trim(command, "\"'")
+
+			aliases[alias] = command
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return aliases, nil
 }
 
 // loadAliases загружает алиасы из файла ~/.termgo_aliases
@@ -722,6 +788,11 @@ func (t *Terminal) executeCommand(cmd string) {
 	t.cursorPos = 0
 	t.history = append(t.history, cmd)
 	t.historyPos = len(t.history)
+
+	// Очищаем список автодополнения
+	t.completionMatches = make([]string, 0)
+	t.completionIndex = 0
+	t.completionScrollOffset = 0
 }
 func (t *Terminal) processCommand(cmd string) []LineSegment {
 	args := strings.Fields(cmd)
@@ -1064,7 +1135,7 @@ func (t *Terminal) processAliasCommand(args []string) []LineSegment {
 	// Если нет аргументов, выводим список всех алиасов
 	if len(args) <= 1 {
 		if len(t.aliases) == 0 {
-			return []LineSegment{{Text: "Нет определенных алиасов", Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)}}
+			return []LineSegment{{Text: "Алиасы не определены. Используйте 'alias имя=команда' для создания алиаса.", Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)}}
 		}
 
 		var segments []LineSegment
@@ -1172,9 +1243,21 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		return
 	}
 	switch ev.Key() {
-	case tcell.KeyEscape, tcell.KeyCtrlC:
+	case tcell.KeyCtrlC:
 		t.screen.Fini()
 		os.Exit(0)
+
+	case tcell.KeyCtrlQ:
+		t.screen.Fini()
+		os.Exit(0)
+
+	case tcell.KeyEscape:
+		// Отмена операций: очистка ввода и списка автодополнения
+		t.inputBuffer = make([]rune, 0)
+		t.cursorPos = 0
+		t.completionMatches = make([]string, 0)
+		t.completionIndex = 0
+		t.completionScrollOffset = 0
 
 	case tcell.KeyEnter:
 		cmd := string(t.inputBuffer)
