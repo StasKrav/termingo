@@ -1,35 +1,40 @@
 package main
 
 import (
-    "bytes"
-    "fmt"
-    "io"
-    "os"
-    "os/exec"
-    "os/user"
-    "regexp"
-    "strings"
-    "time"
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/user"
+	"regexp"
+	"strings"
+	"time"
 
-    "github.com/gdamore/tcell/v2"
-    "golang.org/x/text/encoding/charmap"
-    "golang.org/x/text/transform"
-    "github.com/creack/pty"
+	"github.com/creack/pty"
+	"github.com/gdamore/tcell/v2"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/transform"
 )
 
 type Terminal struct {
-	screen        tcell.Screen
-	inputBuffer   []rune
-	cursorPos     int
-	cursorVisible bool
-	lastBlink     time.Time
-	outputLines   []LineSegment // Храним вывод команд с цветами
-	history       []string      // История команд
-	historyPos    int           // Позиция в истории
-	ptmx        *os.File
-	cmd         *exec.Cmd
-	inPtyMode   bool
-	scrollOffset int
+	screen                 tcell.Screen
+	inputBuffer            []rune
+	cursorPos              int
+	cursorVisible          bool
+	lastBlink              time.Time
+	outputLines            []LineSegment // Храним вывод команд с цветами
+	history                []string      // История команд
+	historyPos             int           // Позиция в истории
+	zshHistory             []string      // История команд из zsh
+	completionMatches      []string      // Варианты автодополнения
+	completionIndex        int           // Текущий индекс в списке вариантов
+	completionScrollOffset int           // Смещение скролла списка вариантов
+	ptmx                   *os.File
+	cmd                    *exec.Cmd
+	inPtyMode              bool
+	scrollOffset           int
 }
 
 // LineSegment представляет сегмент текста с определенным стилем
@@ -76,19 +81,20 @@ var ansiBgColors = map[int]tcell.Color{
 	106: tcell.ColorTeal,
 	107: tcell.ColorWhite,
 }
+
 func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
-	
+
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return []LineSegment{{Text: fmt.Sprintf("Ошибка PTY: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	}
-	
+
 	t.ptmx = ptmx
 	t.cmd = cmd
 	t.inPtyMode = true
-	
+
 	// Чтение вывода в фоне
 	go func() {
 		buf := make([]byte, 1024)
@@ -102,7 +108,7 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 		}
 		t.inPtyMode = false
 	}()
-	
+
 	return []LineSegment{{Text: "Запущена интерактивная команда...", Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
 }
 func main() {
@@ -130,6 +136,14 @@ func main() {
 		historyPos:    0,
 	}
 
+	// Загружаем историю zsh
+	zshHistory, err := loadZshHistory()
+	if err != nil {
+		// В случае ошибки продолжаем работу без истории zsh
+		fmt.Printf("Предупреждение: не удалось загрузить историю zsh: %v\n", err)
+	} else {
+		term.zshHistory = zshHistory
+	}
 	// Устанавливаем темный стиль
 	defStyle := tcell.StyleDefault.
 		Foreground(tcell.ColorWhite).
@@ -168,14 +182,57 @@ func main() {
 	}
 }
 func decodeWindows1251(data []byte) string {
-    // Пробуем декодировать из Windows-1251 (часто используется в Windows)
-    reader := transform.NewReader(bytes.NewReader(data), charmap.Windows1251.NewDecoder())
-    decoded, err := io.ReadAll(reader)
-    if err != nil {
-        // Если не получается, возвращаем как есть
-        return string(data)
-    }
-    return string(decoded)
+	// Пробуем декодировать из Windows-1251 (часто используется в Windows)
+	reader := transform.NewReader(bytes.NewReader(data), charmap.Windows1251.NewDecoder())
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		// Если не получается, возвращаем как есть
+		return string(data)
+	}
+	return string(decoded)
+}
+
+// loadZshHistory загружает историю команд из файла ~/.zsh_history
+func loadZshHistory() ([]string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	historyPath := homeDir + "/.zsh_history"
+	file, err := os.Open(historyPath)
+	if err != nil {
+		// Если файл не найден, возвращаем пустую историю
+		if os.IsNotExist(err) {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	var history []string
+	scanner := bufio.NewScanner(file)
+
+	// Регулярное выражение для извлечения команд из формата zsh_history
+	// Формат: : timestamp:0;command
+	re := regexp.MustCompile(`^: \d+:\d+;(.*)$`)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		matches := re.FindStringSubmatch(line)
+		if len(matches) > 1 {
+			command := matches[1]
+			if command != "" {
+				history = append(history, command)
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return history, nil
 }
 func (t *Terminal) updateCursorBlink() {
 	if time.Since(t.lastBlink) > 500*time.Millisecond {
@@ -185,33 +242,38 @@ func (t *Terminal) updateCursorBlink() {
 }
 
 func (t *Terminal) draw() {
-    width, height := t.screen.Size()
+	width, height := t.screen.Size()
 
-    offsetX := 2
-    offsetY := 2
-    termWidth := width - 4*offsetX
-    termHeight := height - 4*offsetY
+	offsetX := 2
+	offsetY := 2
+	termWidth := width - 4*offsetX
+	termHeight := height - 4*offsetY
 
-    t.screen.Clear()
-    t.drawTerminalArea(offsetX, offsetY, termWidth, termHeight)
+	t.screen.Clear()
+	t.drawTerminalArea(offsetX, offsetY, termWidth, termHeight)
 
-    inputY := offsetY + 1
-    inputLine := "> " + string(t.inputBuffer)
+	inputY := offsetY + 1
+	inputLine := "> " + string(t.inputBuffer)
 
-    t.drawOutput(offsetX, inputY+1, termWidth, termHeight-2)
+	t.drawOutput(offsetX, inputY+1, termWidth, termHeight-2)
 
-    // Рисуем текст
-    t.drawText(offsetX, inputY, inputLine, tcell.StyleDefault.
-        Foreground(tcell.ColorWhite).
-        Background(tcell.ColorDefault))
+	// Рисуем текст
+	t.drawText(offsetX, inputY, inputLine, tcell.StyleDefault.
+		Foreground(tcell.ColorWhite).
+		Background(tcell.ColorDefault))
 
-    // Курсор - правильное вычисление позиции для кириллицы
-    prefix := "> "
-    cursorX := offsetX + len([]rune(prefix)) + t.cursorPos // Используем руны для префикса
-    
-    if t.cursorVisible {
-        t.drawCursor(cursorX, inputY)
-    }
+	// Курсор - правильное вычисление позиции для кириллицы
+	prefix := "> "
+	cursorX := offsetX + len([]rune(prefix)) + t.cursorPos // Используем руны для префикса
+
+	if t.cursorVisible {
+		t.drawCursor(cursorX, inputY)
+	}
+
+	// Отображаем список вариантов автодополнения, если они есть
+	if len(t.completionMatches) > 0 {
+		t.drawCompletionList(offsetX, inputY+2, termWidth)
+	}
 }
 
 func (t *Terminal) drawTerminalArea(x, y, width, height int) {
@@ -240,7 +302,7 @@ func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
 		segment := t.outputLines[i]
 		text := segment.Text
 		runes := []rune(text)
-		
+
 		// Если строка пустая, просто переходим на следующую строку
 		if len(runes) == 0 {
 			currentY++
@@ -256,7 +318,7 @@ func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
 			}
 			line := string(runes[:take])
 			t.drawText(offsetX, currentY, line, segment.Style)
-			
+
 			// Убираем обработанную часть
 			runes = runes[take:]
 			currentY++
@@ -273,18 +335,98 @@ func min(a, b int) int {
 }
 
 func (t *Terminal) drawText(x, y int, text string, style tcell.Style) {
-    runes := []rune(text) // Правильно преобразуем в руны
-    for i, r := range runes {
-        t.screen.SetContent(x+i, y, r, nil, style)
-    }
+	runes := []rune(text) // Правильно преобразуем в руны
+	for i, r := range runes {
+		t.screen.SetContent(x+i, y, r, nil, style)
+	}
 }
 
 func (t *Terminal) drawCursor(x, y int) {
-    style := tcell.StyleDefault.
-        Foreground(tcell.ColorBlack).
-        Background(tcell.ColorWhite)
-    // Используем пробел для курсора вместо символа
-    t.screen.SetContent(x, y, ' ', nil, style)
+	style := tcell.StyleDefault.
+		Foreground(tcell.ColorBlack).
+		Background(tcell.ColorWhite)
+	// Используем пробел для курсора вместо символа
+	t.screen.SetContent(x, y, ' ', nil, style)
+}
+
+// drawCompletionList отображает список вариантов автодополнения
+func (t *Terminal) drawCompletionList(offsetX, offsetY, maxWidth int) {
+	if len(t.completionMatches) == 0 {
+		return
+	}
+
+	// Ограничиваем количество отображаемых вариантов
+	maxVisible := 10
+
+	// Применяем смещение скролла
+	startIndex := t.completionScrollOffset
+	if startIndex >= len(t.completionMatches) {
+		startIndex = 0
+		t.completionScrollOffset = 0
+	}
+
+	// Определяем конечный индекс
+	endIndex := startIndex + maxVisible
+	if endIndex > len(t.completionMatches) {
+		endIndex = len(t.completionMatches)
+	}
+
+	// Получаем подмножество вариантов для отображения
+	matchesToShow := t.completionMatches[startIndex:endIndex]
+
+	// Отображаем каждый вариант
+	for i, match := range matchesToShow {
+		y := offsetY + i
+
+		// Вычисляем глобальный индекс для определения текущего выбора
+		globalIndex := startIndex + i
+
+		// Создаем текст с индикатором текущего выбора
+		var text string
+		if globalIndex == t.completionIndex {
+			text = "> " + match
+		} else {
+			text = "  " + match
+		}
+
+		// Ограничиваем длину текста шириной терминала
+		if len([]rune(text)) > maxWidth {
+			runes := []rune(text)
+			text = string(runes[:maxWidth-3]) + "..."
+		}
+
+		// Выбираем стиль в зависимости от того, является ли это текущим выбором
+		var style tcell.Style
+		if globalIndex == t.completionIndex {
+			style = tcell.StyleDefault.
+				Foreground(tcell.ColorWhite).
+				Background(tcell.ColorBlue)
+		} else {
+			style = tcell.StyleDefault.
+				Foreground(tcell.ColorGray).
+				Background(tcell.ColorDefault)
+		}
+
+		// Отображаем текст
+		t.drawText(offsetX, y, text, style)
+	}
+
+	// Если есть еще варианты, отображаем индикатор прокрутки
+	if len(t.completionMatches) > maxVisible {
+		// Отображаем индикатор прокрутки в правом нижнем углу списка
+		scrollIndicator := fmt.Sprintf("[%d/%d]",
+			startIndex/maxVisible+1,
+			(len(t.completionMatches)+maxVisible-1)/maxVisible)
+
+		indicatorStyle := tcell.StyleDefault.
+			Foreground(tcell.ColorYellow).
+			Background(tcell.ColorDefault)
+
+		t.drawText(offsetX+maxWidth-len([]rune(scrollIndicator)),
+			offsetY+maxVisible-1,
+			scrollIndicator,
+			indicatorStyle)
+	}
 }
 
 // parseANSI преобразует строку с ANSI кодами в сегменты с правильными стилями
@@ -585,7 +727,7 @@ func (t *Terminal) processLsCommand(args []string) []LineSegment {
 			} else {
 				line = entry.Name()
 			}
-			
+
 			// Каждая строка - отдельный сегмент
 			result = append(result, LineSegment{Text: line, Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)})
 		}
@@ -634,113 +776,113 @@ func (t *Terminal) processColorDemo() []LineSegment {
 }
 
 func (t *Terminal) processHelpCommand() []LineSegment {
-    // Стили
-    titleStyle := tcell.StyleDefault.Foreground(tcell.ColorTeal).Bold(true)
-    commandStyle := tcell.StyleDefault.Foreground(tcell.ColorGreen)
-    descStyle := tcell.StyleDefault.Foreground(tcell.ColorWhite)
-    optionStyle := tcell.StyleDefault.Foreground(tcell.ColorYellow)
-    
-    // Сначала формируем весь текст
-    var output strings.Builder
-    
-    // Заголовок
-    output.WriteString("Доступные команды:\n\n")
-    
-    // Команды с выравниванием
-    commands := []struct {
-        cmd  string
-        desc string
-    }{
-        {"exit, quit", "Выйти из терминала"},
-        {"clear", "Очистить экран"},
-        {"echo <текст>", "Вывести текст"},
-        {"pwd", "Показать текущую директорию"},
-        {"time", "Показать текущее время"},
-        {"date", "Показать текущую дату"},
-        {"whoami", "Показать имя текущего пользователя"},
-        {"history", "Показать историю команд"},
-        {"ls [опции]", "Показать содержимое директории"},
-        {"cd <директория>", "Перейти в директорию"},
-        {"colors", "Демонстрация цветов"},
-        {"help", "Показать это сообщение"},
-        {"run <команда>", "Выполнить системную команду"},
-        {"<команда>", "Выполнить системную команду напрямую"},
-    }
-    
-    // Находим максимальную длину команд для выравнивания
-    maxLen := 0
-    for _, cmd := range commands {
-        if len(cmd.cmd) > maxLen {
-            maxLen = len(cmd.cmd)
-        }
-    }
-    
-    // Формируем выровненные строки
-    for _, cmd := range commands {
-        padding := strings.Repeat(" ", maxLen - len(cmd.cmd))
-        output.WriteString("  " + cmd.cmd + padding + "  - " + cmd.desc + "\n")
-    }
-    
-    // Опции для ls
-    output.WriteString("\n  Опции для ls:\n")
-    options := []struct {
-        opt  string
-        desc string
-    }{
-        {"-l", "подробный формат"},
-        {"-a", "показать скрытые файлы"},
-        {"-1", "по одному файлу на строку"},
-    }
-    
-    for _, opt := range options {
-        output.WriteString("    " + opt.opt + " - " + opt.desc + "\n")
-    }
-    
-    // Теперь разбиваем на строки и применяем стили
-    lines := strings.Split(output.String(), "\n")
-    var segments []LineSegment
-    
-    for _, line := range lines {
-        if strings.Contains(line, "Доступные команды:") {
-            segments = append(segments, LineSegment{Text: line, Style: titleStyle})
-        } else if strings.Contains(line, "Опции для ls:") {
-            segments = append(segments, LineSegment{Text: line, Style: descStyle})
-        } else {
-            // Разбираем строку на части для раскраски
-            segments = append(segments, t.colorizeHelpLine(line, commandStyle, descStyle, optionStyle))
-        }
-    }
-    
-    return segments
+	// Стили
+	titleStyle := tcell.StyleDefault.Foreground(tcell.ColorTeal).Bold(true)
+	commandStyle := tcell.StyleDefault.Foreground(tcell.ColorGreen)
+	descStyle := tcell.StyleDefault.Foreground(tcell.ColorWhite)
+	optionStyle := tcell.StyleDefault.Foreground(tcell.ColorYellow)
+
+	// Сначала формируем весь текст
+	var output strings.Builder
+
+	// Заголовок
+	output.WriteString("Доступные команды:\n\n")
+
+	// Команды с выравниванием
+	commands := []struct {
+		cmd  string
+		desc string
+	}{
+		{"exit, quit", "Выйти из терминала"},
+		{"clear", "Очистить экран"},
+		{"echo <текст>", "Вывести текст"},
+		{"pwd", "Показать текущую директорию"},
+		{"time", "Показать текущее время"},
+		{"date", "Показать текущую дату"},
+		{"whoami", "Показать имя текущего пользователя"},
+		{"history", "Показать историю команд"},
+		{"ls [опции]", "Показать содержимое директории"},
+		{"cd <директория>", "Перейти в директорию"},
+		{"colors", "Демонстрация цветов"},
+		{"help", "Показать это сообщение"},
+		{"run <команда>", "Выполнить системную команду"},
+		{"<команда>", "Выполнить системную команду напрямую"},
+	}
+
+	// Находим максимальную длину команд для выравнивания
+	maxLen := 0
+	for _, cmd := range commands {
+		if len(cmd.cmd) > maxLen {
+			maxLen = len(cmd.cmd)
+		}
+	}
+
+	// Формируем выровненные строки
+	for _, cmd := range commands {
+		padding := strings.Repeat(" ", maxLen-len(cmd.cmd))
+		output.WriteString("  " + cmd.cmd + padding + "  - " + cmd.desc + "\n")
+	}
+
+	// Опции для ls
+	output.WriteString("\n  Опции для ls:\n")
+	options := []struct {
+		opt  string
+		desc string
+	}{
+		{"-l", "подробный формат"},
+		{"-a", "показать скрытые файлы"},
+		{"-1", "по одному файлу на строку"},
+	}
+
+	for _, opt := range options {
+		output.WriteString("    " + opt.opt + " - " + opt.desc + "\n")
+	}
+
+	// Теперь разбиваем на строки и применяем стили
+	lines := strings.Split(output.String(), "\n")
+	var segments []LineSegment
+
+	for _, line := range lines {
+		if strings.Contains(line, "Доступные команды:") {
+			segments = append(segments, LineSegment{Text: line, Style: titleStyle})
+		} else if strings.Contains(line, "Опции для ls:") {
+			segments = append(segments, LineSegment{Text: line, Style: descStyle})
+		} else {
+			// Разбираем строку на части для раскраски
+			segments = append(segments, t.colorizeHelpLine(line, commandStyle, descStyle, optionStyle))
+		}
+	}
+
+	return segments
 }
 
 func (t *Terminal) colorizeHelpLine(line string, cmdStyle, descStyle, optStyle tcell.Style) LineSegment {
-    // Простая логика раскраски - если строка начинается с команд, раскрашиваем их
-    if strings.HasPrefix(line, "  ") && len(line) > 2 {
-        // Ищем разделитель " - "
-        if idx := strings.Index(line, " - "); idx != -1 {
-            commandPart := line[:idx]
-            descPart := line[idx:]
-            
-            // Проверяем, является ли это опцией ls (имеет отступ 4 пробела)
-            if strings.HasPrefix(line, "    ") && len(line) > 4 {
-                // Это опция - раскрашиваем флаг
-                if flagIdx := strings.Index(line, " - "); flagIdx != -1 {
-                    flagPart := line[4:flagIdx]
-                    restPart := line[flagIdx:]
-                    coloredLine := flagPart + restPart
-                    return LineSegment{Text: coloredLine, Style: optStyle}
-                }
-            } else {
-                // Это обычная команда
-                coloredLine := commandPart + descPart
-                return LineSegment{Text: coloredLine, Style: cmdStyle}
-            }
-        }
-    }
-    
-    // По умолчанию - обычный текст
-    return LineSegment{Text: line, Style: descStyle}
+	// Простая логика раскраски - если строка начинается с команд, раскрашиваем их
+	if strings.HasPrefix(line, "  ") && len(line) > 2 {
+		// Ищем разделитель " - "
+		if idx := strings.Index(line, " - "); idx != -1 {
+			commandPart := line[:idx]
+			descPart := line[idx:]
+
+			// Проверяем, является ли это опцией ls (имеет отступ 4 пробела)
+			if strings.HasPrefix(line, "    ") && len(line) > 4 {
+				// Это опция - раскрашиваем флаг
+				if flagIdx := strings.Index(line, " - "); flagIdx != -1 {
+					flagPart := line[4:flagIdx]
+					restPart := line[flagIdx:]
+					coloredLine := flagPart + restPart
+					return LineSegment{Text: coloredLine, Style: optStyle}
+				}
+			} else {
+				// Это обычная команда
+				coloredLine := commandPart + descPart
+				return LineSegment{Text: coloredLine, Style: cmdStyle}
+			}
+		}
+	}
+
+	// По умолчанию - обычный текст
+	return LineSegment{Text: line, Style: descStyle}
 }
 
 func (t *Terminal) processHistoryCommand() []LineSegment {
@@ -777,8 +919,6 @@ func (t *Terminal) processCdCommand(args []string) []LineSegment {
 	return []LineSegment{}
 }
 
-
-
 func (t *Terminal) processDateCommand() []LineSegment {
 	// Получаем текущую дату и время
 	currentTime := time.Now()
@@ -808,24 +948,24 @@ func (t *Terminal) processWhoamiCommand() []LineSegment {
 func (t *Terminal) processSystemCommand(args []string) []LineSegment {
 	// Для интерактивных команд используем PTY
 	interactiveCommands := map[string]bool{
-		"vim": true, "vi": true, "nano": true, "top": true, 
+		"vim": true, "vi": true, "nano": true, "top": true,
 		"htop": true, "less": true, "more": true, "man": true,
 	}
-	
+
 	if interactiveCommands[args[0]] {
 		return t.processPtyCommand(args)
 	}
-	
+
 	// Для обычных команд оставляем как было
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
-	
+
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		errorMsg := fmt.Sprintf("Ошибка: %s", err)
 		return []LineSegment{{Text: errorMsg, Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	}
-	
+
 	return []LineSegment{{
 		Text:  string(output),
 		Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
@@ -885,9 +1025,25 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		}
 	// Добавьте в switch-case в handleKeyEvent:
 	case tcell.KeyPgUp:
-		t.scrollOffset += 5
+		// Если отображается список автодополнения, прокручиваем его
+		if len(t.completionMatches) > 0 {
+			t.completionScrollOffset = max(0, t.completionScrollOffset-10)
+		} else {
+			// Иначе прокручиваем основной вывод
+			t.scrollOffset += 5
+		}
 	case tcell.KeyPgDn:
-		t.scrollOffset = max(0, t.scrollOffset-5)
+		// Если отображается список автодополнения, прокручиваем его
+		if len(t.completionMatches) > 0 {
+			maxScroll := len(t.completionMatches) - 10
+			if maxScroll < 0 {
+				maxScroll = 0
+			}
+			t.completionScrollOffset = min(t.completionScrollOffset+10, maxScroll)
+		} else {
+			// Иначе прокручиваем основной вывод
+			t.scrollOffset = max(0, t.scrollOffset-5)
+		}
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if t.cursorPos > 0 && len(t.inputBuffer) > 0 {
 			t.inputBuffer = append(t.inputBuffer[:t.cursorPos-1], t.inputBuffer[t.cursorPos:]...)
@@ -915,7 +1071,19 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 	case tcell.KeyEnd:
 		t.cursorPos = len(t.inputBuffer)
 
+	case tcell.KeyTab:
+		// Если уже есть совпадения, выполняем циклическое переключение
+		if len(t.completionMatches) > 0 {
+			t.cycleCompletion()
+		} else {
+			// Иначе выполняем обычное автодополнение
+			t.autoComplete()
+		}
+
 	case tcell.KeyRune:
+		// При вводе нового символа сбрасываем совпадения автодополнения
+		t.completionMatches = []string{}
+		t.completionIndex = 0
 		t.insertRune(ev.Rune())
 
 	default:
@@ -930,11 +1098,108 @@ func max(a, b int) int {
 	return b
 }
 func (t *Terminal) insertRune(r rune) {
-    // Вставляем руну правильно
-    if t.cursorPos == len(t.inputBuffer) {
-        t.inputBuffer = append(t.inputBuffer, r)
-    } else {
-        t.inputBuffer = append(t.inputBuffer[:t.cursorPos], append([]rune{r}, t.inputBuffer[t.cursorPos:]...)...)
-    }
-    t.cursorPos++
+	// Вставляем руну правильно
+	if t.cursorPos == len(t.inputBuffer) {
+		t.inputBuffer = append(t.inputBuffer, r)
+	} else {
+		t.inputBuffer = append(t.inputBuffer[:t.cursorPos], append([]rune{r}, t.inputBuffer[t.cursorPos:]...)...)
+	}
+	t.cursorPos++
+}
+
+// findCompletionMatches находит все совпадения для автодополнения
+func (t *Terminal) findCompletionMatches() []string {
+	if len(t.inputBuffer) == 0 {
+		return []string{}
+	}
+
+	currentInput := string(t.inputBuffer)
+	var matches []string
+	seen := make(map[string]bool) // Для исключения дубликатов
+
+	// Сначала ищем точные префиксы в истории zsh
+	for i := len(t.zshHistory) - 1; i >= 0; i-- {
+		cmd := t.zshHistory[i]
+		if strings.HasPrefix(cmd, currentInput) && cmd != currentInput {
+			if !seen[cmd] {
+				matches = append(matches, cmd)
+				seen[cmd] = true
+			}
+		}
+	}
+
+	// Затем в внутренней истории
+	for i := len(t.history) - 1; i >= 0; i-- {
+		cmd := t.history[i]
+		if strings.HasPrefix(cmd, currentInput) && cmd != currentInput {
+			if !seen[cmd] {
+				matches = append(matches, cmd)
+				seen[cmd] = true
+			}
+		}
+	}
+
+	// Если точных префиксов не найдено, ищем частичные совпадения
+	// Сначала в истории zsh
+	if len(matches) == 0 {
+		for i := len(t.zshHistory) - 1; i >= 0; i-- {
+			cmd := t.zshHistory[i]
+			if strings.Contains(cmd, currentInput) && cmd != currentInput {
+				if !seen[cmd] {
+					matches = append(matches, cmd)
+					seen[cmd] = true
+				}
+			}
+		}
+
+		// Затем в внутренней истории
+		for i := len(t.history) - 1; i >= 0; i-- {
+			cmd := t.history[i]
+			if strings.Contains(cmd, currentInput) && cmd != currentInput {
+				if !seen[cmd] {
+					matches = append(matches, cmd)
+					seen[cmd] = true
+				}
+			}
+		}
+	}
+
+	return matches
+}
+
+// autoComplete выполняет автодополнение текущего ввода на основе истории команд
+func (t *Terminal) autoComplete() {
+	// Находим все совпадения
+	matches := t.findCompletionMatches()
+
+	if len(matches) == 0 {
+		// Нет совпадений, ничего не делаем
+		return
+	}
+
+	// Сохраняем совпадения и сбрасываем индекс
+	t.completionMatches = matches
+	t.completionIndex = 0
+
+	// Применяем первое совпадение
+	firstMatch := matches[0]
+	t.inputBuffer = []rune(firstMatch)
+	t.cursorPos = len(t.inputBuffer)
+}
+
+// cycleCompletion выполняет циклическое переключение между вариантами автодополнения
+func (t *Terminal) cycleCompletion() {
+	if len(t.completionMatches) == 0 {
+		// Если нет сохраненных совпадений, пытаемся найти их
+		t.autoComplete()
+		return
+	}
+
+	// Переходим к следующему совпадению (циклически)
+	t.completionIndex = (t.completionIndex + 1) % len(t.completionMatches)
+
+	// Применяем текущее совпадение
+	currentMatch := t.completionMatches[t.completionIndex]
+	t.inputBuffer = []rune(currentMatch)
+	t.cursorPos = len(t.inputBuffer)
 }
