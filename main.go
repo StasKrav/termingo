@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"os/user"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -36,6 +38,53 @@ type Terminal struct {
 	inPtyMode              bool
 	scrollOffset           int
 	aliases                map[string]string // Алиасы команд
+	envVars                map[string]string // Переменные окружения
+}
+
+// parseArgs разбирает команду на аргументы с учетом кавычек
+func (t *Terminal) parseArgs(input string) []string {
+	var args []string
+	var current strings.Builder
+	inQuotes := false
+	quoteChar := rune(0)
+
+	for _, r := range input {
+		switch {
+		case r == '"' || r == '\'':
+			if !inQuotes {
+				// Начало кавычек
+				inQuotes = true
+				quoteChar = r
+			} else if quoteChar == r {
+				// Конец кавычек
+				inQuotes = false
+				quoteChar = 0
+			} else {
+				// Кавычка внутри других кавычек
+				current.WriteRune(r)
+			}
+		case r == ' ' || r == '\t':
+			if inQuotes {
+				// Пробел внутри кавычек
+				current.WriteRune(r)
+			} else {
+				// Пробел вне кавычек - конец аргумента
+				if current.Len() > 0 {
+					args = append(args, current.String())
+					current.Reset()
+				}
+			}
+		default:
+			current.WriteRune(r)
+		}
+	}
+
+	// Добавляем последний аргумент
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+
+	return args
 }
 
 // LineSegment представляет сегмент текста с определенным стилем
@@ -84,11 +133,22 @@ var ansiBgColors = map[int]tcell.Color{
 }
 
 func (t *Terminal) processPtyCommand(args []string) []LineSegment {
+	// Добавляем отладочный вывод
+	log.Printf("Запуск команды: %v", args)
+
 	cmd := exec.Command(args[0], args[1:]...)
+
+	// Начинаем с системных переменных окружения
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
+
+	// Добавляем наши переменные окружения
+	for name, value := range t.envVars {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", name, value))
+	}
 
 	// Получаем размер терминала
 	width, height := t.screen.Size()
+	log.Printf("Размер терминала: %dx%d", width, height)
 
 	// Создаем PTY с наследованием размера
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
@@ -96,9 +156,11 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 		Cols: uint16(width),
 	})
 	if err != nil {
+		log.Printf("Ошибка создания PTY: %v", err)
 		return []LineSegment{{Text: fmt.Sprintf("Ошибка PTY: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	}
 
+	log.Printf("PTY успешно создан, команда запущена")
 	t.ptmx = ptmx
 	t.cmd = cmd
 	t.inPtyMode = true
@@ -106,28 +168,75 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 	// Чтение вывода в фоне
 	go func() {
 		defer func() {
+			log.Printf("Завершение PTY goroutine")
 			// Закрываем PTY при завершении
 			if t.ptmx != nil {
 				t.ptmx.Close()
 				t.ptmx = nil
 			}
 			t.inPtyMode = false
+
+			// Ожидаем завершения команды и получаем код возврата
+			if cmd.Process != nil {
+				log.Printf("Ожидание завершения процесса")
+				state, err := cmd.Process.Wait()
+				log.Printf("Процесс завершен, state: %v, err: %v", state, err)
+				if err == nil && state != nil {
+					if state.Success() {
+						t.addColoredOutput(fmt.Sprintf("\n[Команда завершена успешно (код: %d)]\n", state.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorGreen))
+					} else {
+						t.addColoredOutput(fmt.Sprintf("\n[Команда завершена с ошибкой (код: %d)]\n", state.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorRed))
+					}
+				} else {
+					t.addColoredOutput("\n[Команда завершена]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
+				}
+			} else {
+				log.Printf("Процесс отсутствует")
+				t.addColoredOutput("\n[Команда завершена]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
+			}
 		}()
 
 		buf := make([]byte, 1024)
 		for {
 			n, err := ptmx.Read(buf)
 			if err != nil {
+				log.Printf("Ошибка чтения из PTY: %v", err)
+				// Проверяем, является ли ошибка EOF (нормальное завершение)
+				if err == io.EOF {
+					log.Printf("PTY вернул EOF")
+					break
+				}
+				// Для ошибки ввода-вывода выходим из цикла
+				if err == syscall.EIO {
+					log.Printf("PTY вернул ошибку ввода-вывода, завершаем чтение")
+					break
+				}
+				// Для других ошибок просто выходим
 				break
 			}
-			output := string(buf[:n])
-			t.addColoredOutput(output, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+			if n > 0 {
+				output := string(buf[:n])
+				log.Printf("Получен вывод из PTY: %q", output)
+				// Фильтруем пустые строки и строки с только пробелами
+				if strings.TrimSpace(output) != "" {
+					t.addColoredOutput(output, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+				}
+			}
 		}
 	}()
 
-	return []LineSegment{{Text: "Запущена интерактивная команда...", Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
+	return []LineSegment{{Text: "Запущена команда в PTY режиме...", Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
 }
+
 func main() {
+	// Инициализация логирования
+	logFile, err := os.OpenFile("terminal.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatal("Не удалось открыть файл лога:", err)
+	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+
 	os.Setenv("LANG", "en_US.UTF-8")
 	os.Setenv("LC_ALL", "en_US.UTF-8")
 	// Инициализация экрана
@@ -151,6 +260,7 @@ func main() {
 		history:       []string{},
 		historyPos:    0,
 		aliases:       make(map[string]string),
+		envVars:       make(map[string]string),
 	}
 
 	// Загружаем историю zsh
@@ -419,9 +529,14 @@ func (t *Terminal) draw() {
 	t.screen.Clear()
 	t.drawTerminalArea(offsetX, offsetY, termWidth, termHeight)
 
-	inputY := offsetY + 1
-	inputLine := "> " + string(t.inputBuffer)
+	// Получаем текущую директорию
+	currentDir, _ := os.Getwd()
 
+	// Формируем строку приглашения с текущей директорией
+	prompt := currentDir + " $ "
+	inputLine := prompt + string(t.inputBuffer)
+
+	inputY := offsetY + 1
 	t.drawOutput(offsetX, inputY+1, termWidth, termHeight-2)
 
 	// Рисуем текст
@@ -430,7 +545,7 @@ func (t *Terminal) draw() {
 		Background(tcell.ColorDefault))
 
 	// Курсор - правильное вычисление позиции для кириллицы
-	prefix := "> "
+	prefix := prompt
 	cursorX := offsetX + len([]rune(prefix)) + t.cursorPos // Используем руны для префикса
 
 	if t.cursorVisible {
@@ -472,7 +587,6 @@ func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
 
 		// Если строка пустая, просто переходим на следующую строку
 		if len(runes) == 0 {
-			currentY++
 			continue
 		}
 
@@ -484,11 +598,21 @@ func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
 				take = width
 			}
 			line := string(runes[:take])
-			t.drawText(offsetX, currentY, line, segment.Style)
+
+			// Проверяем, что строка не пустая перед отрисовкой
+			// Рисуем строку только если она содержит непробельные символы
+			if strings.TrimSpace(line) != "" {
+				t.drawText(offsetX, currentY, line, segment.Style)
+				currentY++
+			} else if line != "" {
+				// Если строка состоит только из пробелов, рисуем пробелы
+				t.drawText(offsetX, currentY, line, segment.Style)
+				currentY++
+			}
+			// Если строка полностью пустая, просто переходим на следующую строку без отрисовки и без увеличения currentY
 
 			// Убираем обработанную часть
 			runes = runes[take:]
-			currentY++
 		}
 	}
 }
@@ -769,7 +893,7 @@ func (t *Terminal) addColoredOutput(text string, baseStyle tcell.Style) {
 
 func (t *Terminal) expandAliases(cmd string) string {
 	// Разбиваем команду на аргументы
-	args := strings.Fields(cmd)
+	args := t.parseArgs(cmd)
 	if len(args) == 0 {
 		return cmd
 	}
@@ -779,7 +903,21 @@ func (t *Terminal) expandAliases(cmd string) string {
 		// Заменяем алиас на команду
 		if len(args) > 1 {
 			// Если есть дополнительные аргументы, добавляем их к команде
-			return aliasCmd + " " + strings.Join(args[1:], " ")
+			// Объединяем аргументы обратно в строку
+			var cmdBuilder strings.Builder
+			cmdBuilder.WriteString(aliasCmd)
+			for _, arg := range args[1:] {
+				cmdBuilder.WriteString(" ")
+				// Добавляем кавычки вокруг аргументов, содержащих пробелы
+				if strings.Contains(arg, " ") {
+					cmdBuilder.WriteString("\"")
+					cmdBuilder.WriteString(arg)
+					cmdBuilder.WriteString("\"")
+				} else {
+					cmdBuilder.WriteString(arg)
+				}
+			}
+			return cmdBuilder.String()
 		}
 		return aliasCmd
 	}
@@ -825,7 +963,7 @@ func (t *Terminal) executeCommand(cmd string) {
 	t.completionScrollOffset = 0
 }
 func (t *Terminal) processCommand(cmd string) []LineSegment {
-	args := strings.Fields(cmd)
+	args := t.parseArgs(cmd)
 	if len(args) == 0 {
 		return []LineSegment{}
 	}
@@ -882,6 +1020,10 @@ func (t *Terminal) processCommand(cmd string) []LineSegment {
 		segments = t.processAliasCommand(args)
 	case "unalias":
 		segments = t.processUnaliasCommand(args)
+	case "export":
+		segments = t.processExportCommand(args)
+	case "env":
+		segments = t.processEnvCommand()
 	default:
 		segments = t.processSystemCommand(args)
 	}
@@ -1222,32 +1364,80 @@ func (t *Terminal) processUnaliasCommand(args []string) []LineSegment {
 	return []LineSegment{{Text: fmt.Sprintf("Алиас '%s' удален", alias), Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
 }
 
+func (t *Terminal) processExportCommand(args []string) []LineSegment {
+	if len(args) <= 1 {
+		return []LineSegment{{Text: "Используйте: export ИМЯ=значение", Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	// Разбираем аргумент на имя и значение
+	parts := strings.SplitN(args[1], "=", 2)
+	if len(parts) != 2 {
+		return []LineSegment{{Text: "Неправильный формат. Используйте: export ИМЯ=значение", Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	name := parts[0]
+	value := parts[1]
+
+	// Убираем кавычки если есть
+	value = strings.Trim(value, "'\"")
+
+	// Устанавливаем переменную окружения
+	t.envVars[name] = value
+
+	return []LineSegment{{Text: fmt.Sprintf("Переменная окружения '%s' установлена как '%s'", name, value), Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
+}
+
+func (t *Terminal) processEnvCommand() []LineSegment {
+	var segments []LineSegment
+
+	// Отображаем все переменные окружения
+	for name, value := range t.envVars {
+		line := fmt.Sprintf("%s=%s", name, value)
+		segments = append(segments, LineSegment{Text: line, Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)})
+	}
+
+	return segments
+}
+
 func (t *Terminal) processSystemCommand(args []string) []LineSegment {
-	// Для интерактивных команд используем PTY
-	interactiveCommands := map[string]bool{
-		"vim": true, "vi": true, "nano": true, "top": true,
-		"htop": true, "less": true, "more": true, "man": true,
-		"sudo": true,
+	// Заменяем переменные окружения в аргументах
+	processedArgs := make([]string, len(args))
+	for i, arg := range args {
+		processedArgs[i] = t.expandEnvVars(arg)
 	}
 
-	if interactiveCommands[args[0]] {
-		return t.processPtyCommand(args)
-	}
+	// Всегда используем PTY для выполнения системных команд
+	return t.processPtyCommand(processedArgs)
+}
 
-	// Для обычных команд оставляем как было
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
+// expandEnvVars заменяет переменные окружения в строке на их значения
+func (t *Terminal) expandEnvVars(input string) string {
+	// Заменяем переменные вида $ИМЯ или ${ИМЯ}
+	re := regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*)|\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+	return re.ReplaceAllStringFunc(input, func(match string) string {
+		// Извлекаем имя переменной
+		var varName string
+		if match[1] == '{' {
+			// Формат ${ИМЯ}
+			varName = match[2 : len(match)-1]
+		} else {
+			// Формат $ИМЯ
+			varName = match[1:]
+		}
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		errorMsg := fmt.Sprintf("Ошибка: %s", err)
-		return []LineSegment{{Text: errorMsg, Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
-	}
+		// Проверяем в наших переменных
+		if value, exists := t.envVars[varName]; exists {
+			return value
+		}
 
-	return []LineSegment{{
-		Text:  string(output),
-		Style: tcell.StyleDefault.Foreground(tcell.ColorWhite),
-	}}
+		// Проверяем в системных переменных
+		if value := os.Getenv(varName); value != "" {
+			return value
+		}
+
+		// Если переменная не найдена, возвращаем оригинальную строку
+		return match
+	})
 }
 
 func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
@@ -1257,7 +1447,9 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		case tcell.KeyEscape:
 			if ev.Modifiers() == tcell.ModCtrl {
 				// Ctrl+C для отправки сигнала прерывания
-				t.cmd.Process.Signal(os.Interrupt)
+				if t.cmd != nil && t.cmd.Process != nil {
+					t.cmd.Process.Signal(os.Interrupt)
+				}
 				return
 			}
 			t.ptmx.Write([]byte{0x1b}) // ESC
@@ -1272,10 +1464,16 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		// Добавляем обработку специальных клавиш для sudo и других интерактивных команд
 		case tcell.KeyCtrlZ:
 			// Ctrl+Z для приостановки процесса
-			t.ptmx.Write([]byte{0x1A})
+			if t.cmd != nil && t.cmd.Process != nil {
+				t.cmd.Process.Signal(syscall.SIGTSTP)
+			}
 		case tcell.KeyCtrlC:
 			// Ctrl+C для отправки сигнала прерывания
-			t.ptmx.Write([]byte{0x03})
+			if t.cmd != nil && t.cmd.Process != nil {
+				t.cmd.Process.Signal(os.Interrupt)
+			} else {
+				t.ptmx.Write([]byte{0x03})
+			}
 		case tcell.KeyCtrlD:
 			// Ctrl+D для отправки EOF
 			t.ptmx.Write([]byte{0x04})
