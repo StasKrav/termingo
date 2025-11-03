@@ -87,7 +87,14 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
 
-	ptmx, err := pty.Start(cmd)
+	// Получаем размер терминала
+	width, height := t.screen.Size()
+
+	// Создаем PTY с наследованием размера
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Rows: uint16(height),
+		Cols: uint16(width),
+	})
 	if err != nil {
 		return []LineSegment{{Text: fmt.Sprintf("Ошибка PTY: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	}
@@ -98,6 +105,15 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 
 	// Чтение вывода в фоне
 	go func() {
+		defer func() {
+			// Закрываем PTY при завершении
+			if t.ptmx != nil {
+				t.ptmx.Close()
+				t.ptmx = nil
+			}
+			t.inPtyMode = false
+		}()
+
 		buf := make([]byte, 1024)
 		for {
 			n, err := ptmx.Read(buf)
@@ -107,7 +123,6 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 			output := string(buf[:n])
 			t.addColoredOutput(output, tcell.StyleDefault.Foreground(tcell.ColorWhite))
 		}
-		t.inPtyMode = false
 	}()
 
 	return []LineSegment{{Text: "Запущена интерактивная команда...", Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
@@ -1212,6 +1227,7 @@ func (t *Terminal) processSystemCommand(args []string) []LineSegment {
 	interactiveCommands := map[string]bool{
 		"vim": true, "vi": true, "nano": true, "top": true,
 		"htop": true, "less": true, "more": true, "man": true,
+		"sudo": true,
 	}
 
 	if interactiveCommands[args[0]] {
@@ -1240,9 +1256,8 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		switch ev.Key() {
 		case tcell.KeyEscape:
 			if ev.Modifiers() == tcell.ModCtrl {
-				// Ctrl+C для выхода из PTY режима
+				// Ctrl+C для отправки сигнала прерывания
 				t.cmd.Process.Signal(os.Interrupt)
-				t.inPtyMode = false
 				return
 			}
 			t.ptmx.Write([]byte{0x1b}) // ESC
@@ -1254,6 +1269,16 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 			t.ptmx.Write([]byte{'\t'})
 		case tcell.KeyRune:
 			t.ptmx.Write([]byte(string(ev.Rune())))
+		// Добавляем обработку специальных клавиш для sudo и других интерактивных команд
+		case tcell.KeyCtrlZ:
+			// Ctrl+Z для приостановки процесса
+			t.ptmx.Write([]byte{0x1A})
+		case tcell.KeyCtrlC:
+			// Ctrl+C для отправки сигнала прерывания
+			t.ptmx.Write([]byte{0x03})
+		case tcell.KeyCtrlD:
+			// Ctrl+D для отправки EOF
+			t.ptmx.Write([]byte{0x04})
 		}
 		return
 	}
@@ -1360,6 +1385,13 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 				}
 			}
 			// Если достигли конца списка, курсор остается на последнем элементе
+
+			// Применяем текущий элемент из списка автодополнения к вводу
+			if t.completionIndex < len(t.completionMatches) {
+				currentMatch := t.completionMatches[t.completionIndex]
+				t.inputBuffer = []rune(currentMatch)
+				t.cursorPos = len(t.inputBuffer)
+			}
 		} else {
 			// Иначе выполняем обычное автодополнение
 			t.autoComplete()
@@ -1376,6 +1408,13 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 				}
 			}
 			// Если достигли начала списка, курсор остается на первом элементе
+
+			// Применяем текущий элемент из списка автодополнения к вводу
+			if t.completionIndex < len(t.completionMatches) {
+				currentMatch := t.completionMatches[t.completionIndex]
+				t.inputBuffer = []rune(currentMatch)
+				t.cursorPos = len(t.inputBuffer)
+			}
 		} else {
 			// Иначе выполняем обычное автодополнение
 			t.autoComplete()
