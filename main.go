@@ -35,6 +35,7 @@ type Terminal struct {
 	cmd                    *exec.Cmd
 	inPtyMode              bool
 	scrollOffset           int
+	aliases                map[string]string // Алиасы команд
 }
 
 // LineSegment представляет сегмент текста с определенным стилем
@@ -134,6 +135,7 @@ func main() {
 		outputLines:   []LineSegment{},
 		history:       []string{},
 		historyPos:    0,
+		aliases:       make(map[string]string),
 	}
 
 	// Загружаем историю zsh
@@ -144,6 +146,16 @@ func main() {
 	} else {
 		term.zshHistory = zshHistory
 	}
+
+	// Загружаем алиасы
+	aliases, err := loadAliases()
+	if err != nil {
+		// В случае ошибки продолжаем работу без алиасов
+		fmt.Printf("Предупреждение: не удалось загрузить алиасы: %v\n", err)
+	} else {
+		term.aliases = aliases
+	}
+
 	// Устанавливаем темный стиль
 	defStyle := tcell.StyleDefault.
 		Foreground(tcell.ColorWhite).
@@ -233,6 +245,80 @@ func loadZshHistory() ([]string, error) {
 	}
 
 	return history, nil
+}
+
+// saveAliases сохраняет алиасы в файл ~/.termgo_aliases
+func (t *Terminal) saveAliases() error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	aliasesPath := homeDir + "/.termgo_aliases"
+	file, err := os.Create(aliasesPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+
+	// Записываем алиасы в формате alias_name=command
+	for alias, command := range t.aliases {
+		line := fmt.Sprintf("%s=%s\n", alias, command)
+		_, err := writer.WriteString(line)
+		if err != nil {
+			return err
+		}
+	}
+
+	return writer.Flush()
+}
+
+// loadAliases загружает алиасы из файла ~/.termgo_aliases
+func loadAliases() (map[string]string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	aliasesPath := homeDir + "/.termgo_aliases"
+	file, err := os.Open(aliasesPath)
+	if err != nil {
+		// Если файл не найден, возвращаем пустую карту алиасов
+		if os.IsNotExist(err) {
+			return make(map[string]string), nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	aliases := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+
+	// Формат: alias_name=command
+	re := regexp.MustCompile(`^([^=]+)=(.*)$`)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Пропускаем пустые строки и комментарии
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		matches := re.FindStringSubmatch(line)
+		if len(matches) > 2 {
+			alias := matches[1]
+			command := matches[2]
+			aliases[alias] = command
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return aliases, nil
 }
 func (t *Terminal) updateCursorBlink() {
 	if time.Since(t.lastBlink) > 500*time.Millisecond {
@@ -400,7 +486,7 @@ func (t *Terminal) drawCompletionList(offsetX, offsetY, maxWidth int) {
 		if globalIndex == t.completionIndex {
 			style = tcell.StyleDefault.
 				Foreground(tcell.ColorWhite).
-				Background(tcell.ColorBlue)
+				Background(tcell.ColorGray)
 		} else {
 			style = tcell.StyleDefault.
 				Foreground(tcell.ColorGray).
@@ -585,7 +671,30 @@ func (t *Terminal) addColoredOutput(text string, baseStyle tcell.Style) {
 	}
 }
 
+func (t *Terminal) expandAliases(cmd string) string {
+	// Разбиваем команду на аргументы
+	args := strings.Fields(cmd)
+	if len(args) == 0 {
+		return cmd
+	}
+
+	// Проверяем, является ли первое слово алиасом
+	if aliasCmd, exists := t.aliases[args[0]]; exists {
+		// Заменяем алиас на команду
+		if len(args) > 1 {
+			// Если есть дополнительные аргументы, добавляем их к команде
+			return aliasCmd + " " + strings.Join(args[1:], " ")
+		}
+		return aliasCmd
+	}
+
+	return cmd
+}
+
 func (t *Terminal) executeCommand(cmd string) {
+	// Раскрываем алиасы в команде
+	expandedCmd := t.expandAliases(cmd)
+
 	// Добавляем команду и ее вывод в НАЧАЛО вывода (чтобы сдвинуть старый вывод вниз)
 	// Но сначала добавляем текущую команду
 	commandSegment := LineSegment{
@@ -597,7 +706,7 @@ func (t *Terminal) executeCommand(cmd string) {
 	newOutput := []LineSegment{commandSegment}
 
 	// Обрабатываем команду и получаем вывод
-	resultSegments := t.processCommand(cmd)
+	resultSegments := t.processCommand(expandedCmd)
 
 	// Добавляем результат команды после самой команды
 	newOutput = append(newOutput, resultSegments...)
@@ -668,6 +777,10 @@ func (t *Terminal) processCommand(cmd string) []LineSegment {
 				Foreground(tcell.ColorRed).
 				Background(tcell.ColorDefault))
 		}
+	case "alias":
+		segments = t.processAliasCommand(args)
+	case "unalias":
+		segments = t.processUnaliasCommand(args)
 	default:
 		segments = t.processSystemCommand(args)
 	}
@@ -807,6 +920,8 @@ func (t *Terminal) processHelpCommand() []LineSegment {
 		{"help", "Показать это сообщение"},
 		{"run <команда>", "Выполнить системную команду"},
 		{"<команда>", "Выполнить системную команду напрямую"},
+		{"alias [имя[=команда]]", "Определить или показать алиасы"},
+		{"unalias <имя>", "Удалить алиас"},
 	}
 
 	// Находим максимальную длину команд для выравнивания
@@ -943,6 +1058,67 @@ func (t *Terminal) processWhoamiCommand() []LineSegment {
 	return parseANSI(currentUser.Username, tcell.StyleDefault.
 		Foreground(tcell.ColorGreen).
 		Background(tcell.ColorDefault))
+}
+
+func (t *Terminal) processAliasCommand(args []string) []LineSegment {
+	// Если нет аргументов, выводим список всех алиасов
+	if len(args) <= 1 {
+		if len(t.aliases) == 0 {
+			return []LineSegment{{Text: "Нет определенных алиасов", Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)}}
+		}
+
+		var segments []LineSegment
+		for alias, command := range t.aliases {
+			line := fmt.Sprintf("%s='%s'", alias, command)
+			segments = append(segments, LineSegment{Text: line, Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)})
+		}
+		return segments
+	}
+
+	// Проверяем формат аргумента
+	arg := args[1]
+	parts := strings.SplitN(arg, "=", 2)
+	if len(parts) != 2 {
+		return []LineSegment{{Text: "Неправильный формат. Используйте: alias имя='команда'", Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	alias := parts[0]
+	command := strings.Trim(parts[1], "'\"") // Убираем кавычки если есть
+
+	// Добавляем или обновляем алиас
+	t.aliases[alias] = command
+
+	// Сохраняем алиасы в файл
+	err := t.saveAliases()
+	if err != nil {
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка сохранения алиаса: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	return []LineSegment{{Text: fmt.Sprintf("Алиас '%s' установлен как '%s'", alias, command), Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
+}
+
+func (t *Terminal) processUnaliasCommand(args []string) []LineSegment {
+	if len(args) <= 1 {
+		return []LineSegment{{Text: "Используйте: unalias имя_алиаса", Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	alias := args[1]
+
+	// Проверяем, существует ли алиас
+	if _, exists := t.aliases[alias]; !exists {
+		return []LineSegment{{Text: fmt.Sprintf("Алиас '%s' не найден", alias), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	// Удаляем алиас
+	delete(t.aliases, alias)
+
+	// Сохраняем алиасы в файл
+	err := t.saveAliases()
+	if err != nil {
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка сохранения алиасов: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	return []LineSegment{{Text: fmt.Sprintf("Алиас '%s' удален", alias), Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
 }
 
 func (t *Terminal) processSystemCommand(args []string) []LineSegment {
