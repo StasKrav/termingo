@@ -424,7 +424,7 @@ func (t *Terminal) draw() {
 
 	// Отображаем список вариантов автодополнения, если они есть
 	if len(t.completionMatches) > 0 {
-		t.drawCompletionList(offsetX, inputY+2, termWidth)
+		t.drawCompletionList(offsetX, inputY+2, 40)
 	}
 }
 
@@ -526,41 +526,56 @@ func (t *Terminal) drawCompletionList(offsetX, offsetY, maxWidth int) {
 	// Получаем подмножество вариантов для отображения
 	matchesToShow := t.completionMatches[startIndex:endIndex]
 
+	// Рисуем темный фон
+	backgroundStyle := tcell.StyleDefault.
+		Foreground(tcell.ColorWhite).
+		Background(tcell.ColorBlack)
+
+	// Получаем размеры экрана
+	screenWidth, screenHeight := t.screen.Size()
+
+	// Рисуем фон
+	visibleHeight := len(matchesToShow)
+	for i := 0; i < visibleHeight && offsetY+i < screenHeight-1; i++ {
+		for j := 0; j < maxWidth && offsetX+j < screenWidth-1; j++ {
+			// Фон
+			t.screen.SetContent(offsetX+j, offsetY+i, ' ', nil, backgroundStyle)
+		}
+	}
+
 	// Отображаем каждый вариант
 	for i, match := range matchesToShow {
 		y := offsetY + i
-
-		// Вычисляем глобальный индекс для определения текущего выбора
-		globalIndex := startIndex + i
+		x := offsetX + 1
 
 		// Создаем текст с индикатором текущего выбора
 		var text string
-		if globalIndex == t.completionIndex {
+		if startIndex+i == t.completionIndex {
 			text = "> " + match
 		} else {
 			text = "  " + match
 		}
 
 		// Ограничиваем длину текста шириной терминала
-		if len([]rune(text)) > maxWidth {
+		if len([]rune(text)) > maxWidth-2 { // -2 для учета отступа
 			runes := []rune(text)
-			text = string(runes[:maxWidth-3]) + "..."
+			text = string(runes[:maxWidth-5]) + "..." // -5 для учета отступа и "..."
 		}
 
 		// Выбираем стиль в зависимости от того, является ли это текущим выбором
 		var style tcell.Style
-		if globalIndex == t.completionIndex {
+		if startIndex+i == t.completionIndex {
 			style = tcell.StyleDefault.
 				Foreground(tcell.ColorWhite).
 				Background(tcell.ColorGray)
 		} else {
 			style = tcell.StyleDefault.
 				Foreground(tcell.ColorGray).
-				Background(tcell.ColorDefault)
+				Background(tcell.ColorBlack)
 		}
 
 		// Отображаем текст
-		t.drawText(offsetX, y, text, style)
+		t.drawText(x, y, text, style)
 	}
 
 	// Если есть еще варианты, отображаем индикатор прокрутки
@@ -572,10 +587,10 @@ func (t *Terminal) drawCompletionList(offsetX, offsetY, maxWidth int) {
 
 		indicatorStyle := tcell.StyleDefault.
 			Foreground(tcell.ColorYellow).
-			Background(tcell.ColorDefault)
+			Background(tcell.ColorBlack)
 
-		t.drawText(offsetX+maxWidth-len([]rune(scrollIndicator)),
-			offsetY+maxVisible-1,
+		t.drawText(offsetX+maxWidth-len([]rune(scrollIndicator))-1, // -1 для учета отступа
+			offsetY+len(matchesToShow)-1, // -1 для учета отступа
 			scrollIndicator,
 			indicatorStyle)
 	}
@@ -1335,9 +1350,32 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		t.cursorPos = len(t.inputBuffer)
 
 	case tcell.KeyTab:
-		// Если уже есть совпадения, выполняем циклическое переключение
+		// Если отображается список автодополнения, навигация вниз по списку
 		if len(t.completionMatches) > 0 {
-			t.cycleCompletion()
+			if t.completionIndex < len(t.completionMatches)-1 {
+				t.completionIndex++
+				// Проверяем, нужно ли прокрутить список вниз
+				if t.completionIndex >= t.completionScrollOffset+10 {
+					t.completionScrollOffset = t.completionIndex - 9
+				}
+			}
+			// Если достигли конца списка, курсор остается на последнем элементе
+		} else {
+			// Иначе выполняем обычное автодополнение
+			t.autoComplete()
+		}
+
+	case tcell.KeyBacktab: // Shift+Tab
+		// Если отображается список автодополнения, навигация вверх по списку
+		if len(t.completionMatches) > 0 {
+			if t.completionIndex > 0 {
+				t.completionIndex--
+				// Проверяем, нужно ли прокрутить список вверх
+				if t.completionIndex < t.completionScrollOffset {
+					t.completionScrollOffset = t.completionIndex
+				}
+			}
+			// Если достигли начала списка, курсор остается на первом элементе
 		} else {
 			// Иначе выполняем обычное автодополнение
 			t.autoComplete()
