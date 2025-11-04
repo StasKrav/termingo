@@ -37,6 +37,7 @@ type Terminal struct {
 	cmd                    *exec.Cmd
 	inPtyMode              bool
 	scrollOffset           int
+	sudoPrompt             string            // Приглашение ввода пароля для sudo
 	aliases                map[string]string // Алиасы команд
 	envVars                map[string]string // Переменные окружения
 }
@@ -133,15 +134,29 @@ var ansiBgColors = map[int]tcell.Color{
 }
 
 func (t *Terminal) processPtyCommand(args []string) []LineSegment {
-	// Добавляем отладочный вывод
 	log.Printf("Запуск команды: %v", args)
 
-	cmd := exec.Command(args[0], args[1:]...)
+	// Используем shell для запуска команд
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
 
-	// Начинаем с системных переменных окружения
-	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8")
+	// Запускаем через shell чтобы поддерживать сложные команды
+	cmd := exec.Command(shell, "-c", strings.Join(args, " "))
 
-	// Добавляем наши переменные окружения
+	// Наследуем все переменные окружения
+	cmd.Env = os.Environ()
+
+	// Добавляем правильные TERM и цвета
+	cmd.Env = append(cmd.Env,
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+		"LANG=en_US.UTF-8",
+		"LC_ALL=en_US.UTF-8",
+	)
+
+	// Добавляем наши кастомные переменные
 	for name, value := range t.envVars {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", name, value))
 	}
@@ -150,14 +165,15 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 	width, height := t.screen.Size()
 	log.Printf("Размер терминала: %dx%d", width, height)
 
-	// Создаем PTY с наследованием размера
+	// Создаем PTY с правильными размерами
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Rows: uint16(height),
-		Cols: uint16(width),
+		Rows: uint16(height - 4), // Учитываем отступы
+		Cols: uint16(width - 4),
 	})
+
 	if err != nil {
 		log.Printf("Ошибка создания PTY: %v", err)
-		return []LineSegment{{Text: fmt.Sprintf("Ошибка PTY: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	}
 
 	log.Printf("PTY успешно создан, команда запущена")
@@ -166,66 +182,137 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 	t.inPtyMode = true
 
 	// Чтение вывода в фоне
-	go func() {
-		defer func() {
-			log.Printf("Завершение PTY goroutine")
-			// Закрываем PTY при завершении
-			if t.ptmx != nil {
+	go t.handlePtyOutput(ptmx, cmd)
+
+	return []LineSegment{}
+}
+func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
+	defer func() {
+		log.Printf("Завершение PTY goroutine")
+
+		// Закрываем PTY только если он еще не закрыт
+		if t.ptmx != nil {
+			// Проверяем, что это тот же PTY, который мы создали
+			if t.ptmx == ptmx {
 				t.ptmx.Close()
 				t.ptmx = nil
 			}
-			t.inPtyMode = false
+		}
+		t.inPtyMode = false
 
-			// Ожидаем завершения команды и получаем код возврата
-			if cmd.Process != nil {
-				log.Printf("Ожидание завершения процесса")
-				state, err := cmd.Process.Wait()
-				log.Printf("Процесс завершен, state: %v, err: %v", state, err)
-				if err == nil && state != nil {
-					if state.Success() {
-						t.addColoredOutput(fmt.Sprintf("\n[Команда завершена успешно (код: %d)]\n", state.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorGreen))
+		// Ждем завершения процесса с таймаутом
+		if cmd.Process != nil {
+			done := make(chan error, 1)
+			go func() {
+				_, err := cmd.Process.Wait()
+				done <- err
+			}()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					log.Printf("Ошибка ожидания процесса: %v", err)
+				}
+				// Показываем статус завершения команды
+				if cmd.ProcessState != nil {
+					if cmd.ProcessState.Success() {
+						t.addColoredOutput("\n[Команда завершена успешно]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
 					} else {
-						t.addColoredOutput(fmt.Sprintf("\n[Команда завершена с ошибкой (код: %d)]\n", state.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorRed))
+						t.addColoredOutput(fmt.Sprintf("\n[Команда завершена с кодом: %d]\n", cmd.ProcessState.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorYellow))
 					}
-				} else {
-					t.addColoredOutput("\n[Команда завершена]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
 				}
-			} else {
-				log.Printf("Процесс отсутствует")
-				t.addColoredOutput("\n[Команда завершена]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
-			}
-		}()
-
-		buf := make([]byte, 1024)
-		for {
-			n, err := ptmx.Read(buf)
-			if err != nil {
-				log.Printf("Ошибка чтения из PTY: %v", err)
-				// Проверяем, является ли ошибка EOF (нормальное завершение)
-				if err == io.EOF {
-					log.Printf("PTY вернул EOF")
-					break
-				}
-				// Для ошибки ввода-вывода выходим из цикла
-				if err == syscall.EIO {
-					log.Printf("PTY вернул ошибку ввода-вывода, завершаем чтение")
-					break
-				}
-				// Для других ошибок просто выходим
-				break
-			}
-			if n > 0 {
-				output := string(buf[:n])
-				log.Printf("Получен вывод из PTY: %q", output)
-				// Фильтруем пустые строки и строки с только пробелами
-				if strings.TrimSpace(output) != "" {
-					t.addColoredOutput(output, tcell.StyleDefault.Foreground(tcell.ColorWhite))
-				}
+			case <-time.After(5 * time.Second):
+				log.Printf("Таймаут ожидания завершения процесса")
+				t.addColoredOutput("\n[Таймаут ожидания завершения команды]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
 			}
 		}
 	}()
 
-	return []LineSegment{{Text: "Запущена команда в PTY режиме...", Style: tcell.StyleDefault.Foreground(tcell.ColorGreen)}}
+	buf := make([]byte, 8192) // Увеличиваем буфер до 8KB
+	retries := 0
+	maxRetries := 3
+
+	for {
+		n, err := ptmx.Read(buf)
+		if err != nil {
+			// Проверяем различные типы ошибок
+			if err == io.EOF {
+				log.Printf("PTY вернул EOF")
+				// При EOF проверяем, есть ли еще данные
+				if n > 0 {
+					// Обрабатываем оставшиеся данные
+					output := buf[:n]
+					text := string(output)
+					text = t.filterControlSequences(text)
+					if strings.TrimSpace(text) != "" {
+						t.addColoredOutput(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+					}
+				}
+				break
+			} else if strings.Contains(err.Error(), "input/output error") {
+				retries++
+				log.Printf("PTY I/O ошибка: %v, попытка %d/%d", err, retries, maxRetries)
+				if retries < maxRetries {
+					// Небольшая задержка перед повторной попыткой
+					time.Sleep(50 * time.Millisecond)
+					continue
+				} else {
+					log.Printf("Превышено максимальное количество попыток чтения из PTY")
+					t.addColoredOutput("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
+					break
+				}
+			} else {
+				log.Printf("Ошибка чтения из PTY: %v", err)
+				// Для других ошибок показываем сообщение пользователю
+				t.addColoredOutput(fmt.Sprintf("\n[Ошибка PTY: %v]\n", err), tcell.StyleDefault.Foreground(tcell.ColorRed))
+				break
+			}
+		}
+
+		// Сбрасываем счетчик повторных попыток при успешном чтении
+		retries = 0
+
+		if n > 0 {
+			output := buf[:n]
+
+			// Конвертируем в строку с обработкой UTF-8
+			text := string(output)
+
+			// Фильтруем управляющие последовательности кроме цветов
+			text = t.filterControlSequences(text)
+
+			// Проверяем, является ли вывод приглашением ввода пароля от sudo
+			if strings.Contains(text, "[sudo] password for") ||
+				strings.Contains(text, "Password:") ||
+				strings.Contains(text, "password for") ||
+				strings.Contains(text, "Пароль:") {
+				// Сохраняем приглашение для отображения в отдельной области
+				t.sudoPrompt = strings.TrimSpace(text)
+			} else if strings.TrimSpace(text) != "" {
+				// Обычный вывод добавляем в основной буфер
+				t.addColoredOutput(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+				// Очищаем приглашение sudo, так как это обычный вывод
+				t.sudoPrompt = ""
+			}
+		}
+	}
+}
+func (t *Terminal) filterControlSequences(text string) string {
+	// Оставляем только ANSI цветовые коды и удаляем другие управляющие последовательности
+	re := regexp.MustCompile(`\x1b\[[?0-9;]*[a-zA-Z]`)
+
+	// Разрешаем только определенные последовательности
+	allowed := regexp.MustCompile(`\x1b\[[0-9;]*m`) // Цветовые коды
+
+	// Удаляем неразрешенные последовательности
+	cleaned := re.ReplaceAllStringFunc(text, func(match string) string {
+		if allowed.MatchString(match) {
+			return match // Оставляем цветовые коды
+		}
+		return "" // Удаляем другие последовательности
+	})
+
+	return cleaned
 }
 
 func main() {
@@ -552,9 +639,18 @@ func (t *Terminal) draw() {
 		t.drawCursor(cursorX, inputY)
 	}
 
+	// Отображаем приглашение sudo, если оно есть
+	sudoPromptY := inputY + 1
+	if t.sudoPrompt != "" {
+		t.drawText(offsetX, sudoPromptY, t.sudoPrompt, tcell.StyleDefault.
+			Foreground(tcell.ColorYellow).
+			Background(tcell.ColorDefault))
+		sudoPromptY++ // Увеличиваем Y для следующего элемента
+	}
+
 	// Отображаем список вариантов автодополнения, если они есть
 	if len(t.completionMatches) > 0 {
-		t.drawCompletionList(offsetX, inputY+2, 40)
+		t.drawCompletionList(offsetX, sudoPromptY, 40)
 	}
 }
 
@@ -574,46 +670,93 @@ func (t *Terminal) drawOutput(offsetX, offsetY, width, height int) {
 	availableHeight := height
 	currentY := offsetY
 
-	// Пропускаем строки согласно прокрутке
-	startIndex := 0
-	if t.scrollOffset > 0 && t.scrollOffset < len(t.outputLines) {
-		startIndex = t.scrollOffset
-	}
+	// Пропускаем первые scrollOffset строк
+	skippedLines := 0
+	lineIndex := 0
 
-	for i := startIndex; i < len(t.outputLines) && currentY < offsetY+availableHeight; i++ {
-		segment := t.outputLines[i]
+	// Сначала пропускаем нужное количество строк
+	for lineIndex < len(t.outputLines) && skippedLines < t.scrollOffset {
+		segment := t.outputLines[lineIndex]
 		text := segment.Text
-		runes := []rune(text)
 
-		// Если строка пустая, просто переходим на следующую строку
-		if len(runes) == 0 {
+		// Пропускаем полностью пустые строки
+		if strings.TrimSpace(text) == "" {
+			lineIndex++
 			continue
 		}
 
-		// Разбиваем длинные строки на несколько строк
-		for len(runes) > 0 && currentY < offsetY+availableHeight {
-			// Берем столько символов, сколько влезает в ширину
-			take := len(runes)
-			if width < take {
-				take = width
-			}
-			line := string(runes[:take])
+		// Разбиваем на строки по переносам
+		lines := strings.Split(text, "\n")
+		skippedLines += len(lines)
+		lineIndex++
+	}
 
-			// Проверяем, что строка не пустая перед отрисовкой
-			// Рисуем строку только если она содержит непробельные символы
-			if strings.TrimSpace(line) != "" {
-				t.drawText(offsetX, currentY, line, segment.Style)
-				currentY++
-			} else if line != "" {
-				// Если строка состоит только из пробелов, рисуем пробелы
-				t.drawText(offsetX, currentY, line, segment.Style)
-				currentY++
-			}
-			// Если строка полностью пустая, просто переходим на следующую строку без отрисовки и без увеличения currentY
+	// Если пропустили больше строк, чем нужно, корректируем
+	if skippedLines > t.scrollOffset {
+		// Нужно отобразить часть последней пропущенной строки
+		segment := t.outputLines[lineIndex-1]
+		text := segment.Text
+		lines := strings.Split(text, "\n")
+		linesToSkip := skippedLines - t.scrollOffset
+		if linesToSkip < len(lines) {
+			// Отображаем оставшиеся строки из последнего сегмента
+			for i := linesToSkip; i < len(lines); i++ {
+				line := lines[i]
+				if currentY >= offsetY+availableHeight {
+					break
+				}
 
-			// Убираем обработанную часть
-			runes = runes[take:]
+				runes := []rune(line)
+				for len(runes) > 0 && currentY < offsetY+availableHeight {
+					take := min(len(runes), width)
+					chunk := string(runes[:take])
+
+					// Рисуем только непустые чанки
+					if strings.TrimSpace(chunk) != "" {
+						t.drawText(offsetX, currentY, chunk, segment.Style)
+					}
+
+					currentY++
+					runes = runes[take:]
+				}
+			}
 		}
+	}
+
+	// Отображаем оставшиеся строки
+	for lineIndex < len(t.outputLines) && currentY < offsetY+availableHeight {
+		segment := t.outputLines[lineIndex]
+		text := segment.Text
+
+		// Пропускаем полностью пустые строки
+		if strings.TrimSpace(text) == "" {
+			lineIndex++
+			continue
+		}
+
+		// Разбиваем на строки по переносам
+		lines := strings.Split(text, "\n")
+
+		for _, line := range lines {
+			if currentY >= offsetY+availableHeight {
+				break
+			}
+
+			runes := []rune(line)
+			for len(runes) > 0 && currentY < offsetY+availableHeight {
+				take := min(len(runes), width)
+				chunk := string(runes[:take])
+
+				// Рисуем только непустые чанки
+				if strings.TrimSpace(chunk) != "" {
+					t.drawText(offsetX, currentY, chunk, segment.Style)
+				}
+
+				currentY++
+				runes = runes[take:]
+			}
+		}
+		lineIndex++
 	}
 }
 
@@ -1400,14 +1543,15 @@ func (t *Terminal) processEnvCommand() []LineSegment {
 }
 
 func (t *Terminal) processSystemCommand(args []string) []LineSegment {
-	// Заменяем переменные окружения в аргументах
-	processedArgs := make([]string, len(args))
-	for i, arg := range args {
-		processedArgs[i] = t.expandEnvVars(arg)
+	// Проверяем базовые команды которые должны работать без PTY
+	switch args[0] {
+	case "cd", "export", "alias", "unalias":
+		// Эти команды обрабатываем напрямую
+		return t.processCommand(strings.Join(args, " "))
+	default:
+		// Все остальные через PTY
+		return t.processPtyCommand(args)
 	}
-
-	// Всегда используем PTY для выполнения системных команд
-	return t.processPtyCommand(processedArgs)
 }
 
 // expandEnvVars заменяет переменные окружения в строке на их значения
@@ -1441,8 +1585,37 @@ func (t *Terminal) expandEnvVars(input string) string {
 }
 
 func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
+
 	// Если в режиме PTY, передаем ввод в команду
 	if t.inPtyMode && t.ptmx != nil {
+		// Если есть приглашение sudo, передаем все вводимые символы в PTY
+		if t.sudoPrompt != "" {
+			switch ev.Key() {
+			case tcell.KeyEnter:
+				t.ptmx.Write([]byte{'\r'})
+				// После нажатия Enter очищаем приглашение sudo
+				t.sudoPrompt = ""
+			case tcell.KeyBackspace, tcell.KeyBackspace2:
+				t.ptmx.Write([]byte{'\b'})
+			case tcell.KeyRune:
+				t.ptmx.Write([]byte(string(ev.Rune())))
+			case tcell.KeyCtrlC:
+				// Ctrl+C для отправки сигнала прерывания
+				if t.cmd != nil && t.cmd.Process != nil {
+					t.cmd.Process.Signal(os.Interrupt)
+				} else {
+					t.ptmx.Write([]byte{0x03})
+				}
+				// Очищаем приглашение sudo при прерывании
+				t.sudoPrompt = ""
+			case tcell.KeyEscape:
+				t.ptmx.Write([]byte{0x1b}) // ESC
+			default:
+				// Для других клавиш ничего не делаем
+			}
+			return
+		}
+
 		switch ev.Key() {
 		case tcell.KeyEscape:
 			if ev.Modifiers() == tcell.ModCtrl {
@@ -1461,6 +1634,7 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 			t.ptmx.Write([]byte{'\t'})
 		case tcell.KeyRune:
 			t.ptmx.Write([]byte(string(ev.Rune())))
+
 		// Добавляем обработку специальных клавиш для sudo и других интерактивных команд
 		case tcell.KeyCtrlZ:
 			// Ctrl+Z для приостановки процесса
@@ -1504,21 +1678,33 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		}
 
 	case tcell.KeyUp:
-		if t.historyPos > 0 {
-			t.historyPos--
-			t.inputBuffer = []rune(t.history[t.historyPos])
-			t.cursorPos = len(t.inputBuffer)
+		if ev.Modifiers() == tcell.ModCtrl {
+			// Ctrl+стрелка вверх - прокрутка вывода вверх
+			t.scrollOffset += 1
+		} else {
+			// Обычная стрелка вверх - навигация по истории
+			if t.historyPos > 0 {
+				t.historyPos--
+				t.inputBuffer = []rune(t.history[t.historyPos])
+				t.cursorPos = len(t.inputBuffer)
+			}
 		}
 
 	case tcell.KeyDown:
-		if t.historyPos < len(t.history)-1 {
-			t.historyPos++
-			t.inputBuffer = []rune(t.history[t.historyPos])
-			t.cursorPos = len(t.inputBuffer)
-		} else if t.historyPos == len(t.history)-1 {
-			t.historyPos = len(t.history)
-			t.inputBuffer = make([]rune, 0)
-			t.cursorPos = 0
+		if ev.Modifiers() == tcell.ModCtrl {
+			// Ctrl+стрелка вниз - прокрутка вывода вниз
+			t.scrollOffset = max(0, t.scrollOffset-1)
+		} else {
+			// Обычная стрелка вниз - навигация по истории
+			if t.historyPos < len(t.history)-1 {
+				t.historyPos++
+				t.inputBuffer = []rune(t.history[t.historyPos])
+				t.cursorPos = len(t.inputBuffer)
+			} else if t.historyPos == len(t.history)-1 {
+				t.historyPos = len(t.history)
+				t.inputBuffer = make([]rune, 0)
+				t.cursorPos = 0
+			}
 		}
 	// Добавьте в switch-case в handleKeyEvent:
 	case tcell.KeyPgUp:
