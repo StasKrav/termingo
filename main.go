@@ -136,6 +136,10 @@ var ansiBgColors = map[int]tcell.Color{
 func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 	log.Printf("Запуск команды: %v", args)
 
+	// Добавляем команду в начало вывода, как в executeCommand
+	commandText := "> " + strings.Join(args, " ")
+	t.addColoredOutputAtBeginning(commandText, tcell.StyleDefault.Foreground(tcell.ColorGray).Background(tcell.ColorDefault))
+
 	// Используем shell для запуска команд
 	shell := os.Getenv("SHELL")
 	if shell == "" {
@@ -216,14 +220,14 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 				// Показываем статус завершения команды
 				if cmd.ProcessState != nil {
 					if cmd.ProcessState.Success() {
-						t.addColoredOutput("\n[Команда завершена успешно]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
+						t.addColoredOutputAtBeginning("\n[Команда завершена успешно]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
 					} else {
-						t.addColoredOutput(fmt.Sprintf("\n[Команда завершена с кодом: %d]\n", cmd.ProcessState.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorYellow))
+						t.addColoredOutputAtBeginning(fmt.Sprintf("\n[Команда завершена с кодом: %d]\n", cmd.ProcessState.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorYellow))
 					}
 				}
 			case <-time.After(5 * time.Second):
 				log.Printf("Таймаут ожидания завершения процесса")
-				t.addColoredOutput("\n[Таймаут ожидания завершения команды]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
+				t.addColoredOutputAtBeginning("\n[Таймаут ожидания завершения команды]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
 			}
 		}
 	}()
@@ -245,7 +249,7 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 					text := string(output)
 					text = t.filterControlSequences(text)
 					if strings.TrimSpace(text) != "" {
-						t.addColoredOutput(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+						t.addColoredOutputAtBeginning(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
 					}
 				}
 				break
@@ -258,13 +262,13 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 					continue
 				} else {
 					log.Printf("Превышено максимальное количество попыток чтения из PTY")
-					t.addColoredOutput("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
+					t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
 					break
 				}
 			} else {
 				log.Printf("Ошибка чтения из PTY: %v", err)
 				// Для других ошибок показываем сообщение пользователю
-				t.addColoredOutput(fmt.Sprintf("\n[Ошибка PTY: %v]\n", err), tcell.StyleDefault.Foreground(tcell.ColorRed))
+				t.addColoredOutputAtBeginning(fmt.Sprintf("\n[Ошибка PTY: %v]\n", err), tcell.StyleDefault.Foreground(tcell.ColorRed))
 				break
 			}
 		}
@@ -290,7 +294,7 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 				t.sudoPrompt = strings.TrimSpace(text)
 			} else if strings.TrimSpace(text) != "" {
 				// Обычный вывод добавляем в основной буфер
-				t.addColoredOutput(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+				t.addColoredOutputAtBeginning(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
 				// Очищаем приглашение sudo, так как это обычный вывод
 				t.sudoPrompt = ""
 			}
@@ -1032,6 +1036,33 @@ func (t *Terminal) addColoredOutput(text string, baseStyle tcell.Style) {
 			t.outputLines = append(t.outputLines, LineSegment{Text: line, Style: segment.Style})
 		}
 	}
+}
+
+// addColoredOutputAtBeginning добавляет цветной вывод в НАЧАЛО outputLines
+func (t *Terminal) addColoredOutputAtBeginning(text string, baseStyle tcell.Style) {
+	segments := parseANSI(text, baseStyle)
+
+	// Создаем новый слайс и добавляем новые сегменты ПЕРВЫМИ
+	newOutput := []LineSegment{}
+
+	// Добавляем новые сегменты
+	for _, segment := range segments {
+		// Разбиваем на строки если есть переносы
+		lines := strings.Split(segment.Text, "\n")
+		for i, line := range lines {
+			if i > 0 {
+				// Добавляем явный перенос строки между частями
+				newOutput = append(newOutput, LineSegment{Text: "\n", Style: segment.Style})
+			}
+			newOutput = append(newOutput, LineSegment{Text: line, Style: segment.Style})
+		}
+	}
+
+	// Добавляем весь старый вывод ПОСЛЕ новых сегментов
+	newOutput = append(newOutput, t.outputLines...)
+
+	// Заменяем старый вывод на новый
+	t.outputLines = newOutput
 }
 
 func (t *Terminal) expandAliases(cmd string) string {
