@@ -187,6 +187,37 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 	go t.handlePtyOutput(ptmx, cmd)
 
 	log.Printf("Завершение processPtyCommand")
+
+	// Запускаем горутину для мониторинга завершения процесса
+	go func() {
+		if cmd.Process != nil {
+			// Ждем завершения процесса
+			_, err := cmd.Process.Wait()
+			if err != nil {
+				log.Printf("Ошибка ожидания завершения процесса: %v", err)
+			}
+
+			// Если PTY все еще открыт, закрываем его
+			if t.ptmx != nil && t.ptmx == ptmx {
+				log.Printf("Закрытие PTY после завершения процесса")
+				t.ptmx.Close()
+				t.ptmx = nil
+			}
+
+			// Сигнализируем о закрытии PTY
+			if t.ptyClosed != nil {
+				select {
+				case <-t.ptyClosed:
+					// Канал уже закрыт
+				default:
+					// Канал еще открыт, закрываем его
+					close(t.ptyClosed)
+				}
+				t.ptyClosed = nil
+			}
+		}
+	}()
+
 	return []LineSegment{}
 }
 func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
@@ -198,7 +229,11 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 		if t.ptmx != nil {
 			// Проверяем, что это тот же PTY, который мы создали
 			if t.ptmx == ptmx {
-				t.ptmx.Close()
+				log.Printf("Закрытие PTY")
+				err := t.ptmx.Close()
+				if err != nil {
+					log.Printf("Ошибка закрытия PTY: %v", err)
+				}
 				t.ptmx = nil
 			}
 		}
@@ -206,6 +241,7 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 
 		// Ждем завершения процесса с таймаутом
 		if cmd.Process != nil {
+			log.Printf("Ожидание завершения процесса %d", cmd.Process.Pid)
 			done := make(chan error, 1)
 			go func() {
 				_, err := cmd.Process.Wait()
@@ -219,11 +255,16 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 				}
 				// Показываем статус завершения команды
 				if cmd.ProcessState != nil {
+					log.Printf("Процесс завершен: %v", cmd.ProcessState)
 					if cmd.ProcessState.Success() {
 						t.addColoredOutputAtBeginning("\n[Команда завершена успешно]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
 					} else {
 						t.addColoredOutputAtBeginning(fmt.Sprintf("\n[Команда завершена с кодом: %d]\n", cmd.ProcessState.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorYellow))
 					}
+				} else {
+					// Если ProcessState еще не установлен, но процесс завершен
+					log.Printf("Процесс завершен, но ProcessState еще не доступен")
+					t.addColoredOutputAtBeginning("\n[Команда завершена]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
 				}
 			case <-time.After(5 * time.Second):
 				log.Printf("Таймаут ожидания завершения процесса")
@@ -233,7 +274,16 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 
 		// Сигнализируем о закрытии PTY
 		if t.ptyClosed != nil {
-			close(t.ptyClosed)
+			log.Printf("Закрытие канала ptyClosed")
+			// Проверяем, не закрыт ли канал уже
+			select {
+			case <-t.ptyClosed:
+				// Канал уже закрыт
+				log.Printf("Канал ptyClosed уже закрыт")
+			default:
+				// Канал еще открыт, закрываем его
+				close(t.ptyClosed)
+			}
 			t.ptyClosed = nil
 		}
 
@@ -242,7 +292,7 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 
 	buf := make([]byte, 16384) // Увеличиваем буфер до 16KB
 	retries := 0
-	maxRetries := 5
+	maxRetries := 10
 
 	for {
 		n, err := ptmx.Read(buf)
@@ -264,13 +314,45 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 			} else if strings.Contains(err.Error(), "input/output error") {
 				retries++
 				log.Printf("PTY I/O ошибка: %v, попытка %d/%d", err, retries, maxRetries)
+				log.Printf("Состояние PTY: ptmx=%v, cmd=%v, inPtyMode=%v", t.ptmx, t.cmd, t.inPtyMode)
+				if t.cmd != nil && t.cmd.Process != nil {
+					log.Printf("Состояние процесса: pid=%d, exited=%v", t.cmd.Process.Pid, t.cmd.ProcessState)
+				}
+
+				// Проверяем, завершился ли процесс
+				if t.cmd != nil && t.cmd.ProcessState != nil && t.cmd.ProcessState.Exited() {
+					log.Printf("Процесс уже завершен, пропускаем ошибку ввода-вывода")
+					// Если процесс завершен, то ошибка ввода-вывода может быть нормальной
+					break
+				}
+
+				// Проверяем, есть ли активные данные в буфере
+				if n > 0 {
+					log.Printf("Обнаружены данные в буфере (%d байт) перед ошибкой ввода-вывода", n)
+					// Обрабатываем оставшиеся данные перед завершением
+					output := buf[:n]
+					text := string(output)
+					text = t.filterControlSequences(text)
+					if strings.TrimSpace(text) != "" {
+						t.addColoredOutputAtBeginning(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
+					}
+					// После обработки данных выходим, так как ошибка может быть нормальной
+					break
+				}
+
 				if retries < maxRetries {
 					// Небольшая задержка перед повторной попыткой
-					time.Sleep(50 * time.Millisecond)
+					time.Sleep(100 * time.Millisecond)
 					continue
 				} else {
 					log.Printf("Превышено максимальное количество попыток чтения из PTY")
-					t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
+					// Проверяем, были ли получены какие-либо данные
+					if len(t.outputLines) == 0 {
+						t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
+					} else {
+						// Если данные были получены, то ошибка может быть не критичной
+						log.Printf("Данные были получены, ошибка ввода-вывода может быть проигнорирована")
+					}
 					break
 				}
 			} else if strings.Contains(err.Error(), "resource temporarily unavailable") {
@@ -1636,15 +1718,26 @@ func (t *Terminal) expandEnvVars(input string) string {
 func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 	// writeWithRetry пытается записать данные в PTY с повторными попытками при ошибках
 	writeWithRetry := func(data []byte) {
-		maxRetries := 3
+		maxRetries := 5
 		for i := 0; i < maxRetries; i++ {
+			// Проверяем состояние PTY перед записью
+			if t.ptmx == nil {
+				log.Printf("Попытка записи в nil PTY (попытка %d/%d)", i+1, maxRetries)
+				t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY: PTY закрыт]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
+				return
+			}
+
 			_, err := t.ptmx.Write(data)
 			if err == nil {
 				return // Успешно записано
 			}
 			log.Printf("Ошибка записи в PTY (попытка %d/%d): %v", i+1, maxRetries, err)
+			log.Printf("Состояние PTY: ptmx=%v, cmd=%v, inPtyMode=%v", t.ptmx, t.cmd, t.inPtyMode)
+			if t.cmd != nil && t.cmd.Process != nil {
+				log.Printf("Состояние процесса: pid=%d, exited=%v", t.cmd.Process.Pid, t.cmd.ProcessState)
+			}
 			if i < maxRetries-1 {
-				time.Sleep(10 * time.Millisecond) // Небольшая задержка перед повторной попыткой
+				time.Sleep(50 * time.Millisecond) // Небольшая задержка перед повторной попыткой
 			}
 		}
 		// Если все попытки неудачны, показываем сообщение пользователю
@@ -1657,6 +1750,7 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		select {
 		case <-t.ptyClosed:
 			// PTY закрыт, выходим из режима PTY
+			log.Printf("PTY закрыт через канал ptyClosed")
 			t.inPtyMode = false
 			t.ptmx = nil
 			t.cmd = nil
@@ -1664,6 +1758,35 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 			return
 		default:
 			// PTY все еще открыт, продолжаем обработку
+		}
+
+		// Дополнительная проверка состояния PTY
+		if t.ptmx == nil {
+			log.Printf("PTY стал nil во время обработки")
+			t.inPtyMode = false
+			t.cmd = nil
+			t.ptyClosed = nil
+			return
+		}
+
+		// Проверяем состояние процесса
+		if t.cmd != nil && t.cmd.Process != nil {
+			// Проверяем, завершился ли процесс
+			if t.cmd.ProcessState != nil && t.cmd.ProcessState.Exited() {
+				log.Printf("Процесс уже завершен: %v", t.cmd.ProcessState)
+				// Закрываем PTY и выходим из режима PTY
+				if t.ptmx != nil {
+					t.ptmx.Close()
+					t.ptmx = nil
+				}
+				t.inPtyMode = false
+				t.cmd = nil
+				if t.ptyClosed != nil {
+					close(t.ptyClosed)
+					t.ptyClosed = nil
+				}
+				return
+			}
 		}
 
 		// Если есть приглашение sudo, передаем все вводимые символы в PTY
