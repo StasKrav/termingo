@@ -40,6 +40,7 @@ type Terminal struct {
 	sudoPrompt             string            // Приглашение ввода пароля для sudo
 	aliases                map[string]string // Алиасы команд
 	envVars                map[string]string // Переменные окружения
+	ptyClosed              chan struct{}     // Канал для сигнализации о закрытии PTY
 }
 
 // parseArgs разбирает команду на аргументы с учетом кавычек
@@ -134,11 +135,7 @@ var ansiBgColors = map[int]tcell.Color{
 }
 
 func (t *Terminal) processPtyCommand(args []string) []LineSegment {
-	log.Printf("Запуск команды: %v", args)
-
-	// Добавляем команду в начало вывода, как в executeCommand
-	commandText := "> " + strings.Join(args, " ")
-	t.addColoredOutputAtBeginning(commandText, tcell.StyleDefault.Foreground(tcell.ColorGray).Background(tcell.ColorDefault))
+	log.Printf("Начало processPtyCommand: %v", args)
 
 	// Используем shell для запуска команд
 	shell := os.Getenv("SHELL")
@@ -184,13 +181,16 @@ func (t *Terminal) processPtyCommand(args []string) []LineSegment {
 	t.ptmx = ptmx
 	t.cmd = cmd
 	t.inPtyMode = true
+	t.ptyClosed = make(chan struct{})
 
 	// Чтение вывода в фоне
 	go t.handlePtyOutput(ptmx, cmd)
 
+	log.Printf("Завершение processPtyCommand")
 	return []LineSegment{}
 }
 func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
+	log.Printf("Начало handlePtyOutput")
 	defer func() {
 		log.Printf("Завершение PTY goroutine")
 
@@ -230,11 +230,19 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 				t.addColoredOutputAtBeginning("\n[Таймаут ожидания завершения команды]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
 			}
 		}
+
+		// Сигнализируем о закрытии PTY
+		if t.ptyClosed != nil {
+			close(t.ptyClosed)
+			t.ptyClosed = nil
+		}
+
+		log.Printf("Завершение handlePtyOutput")
 	}()
 
-	buf := make([]byte, 8192) // Увеличиваем буфер до 8KB
+	buf := make([]byte, 16384) // Увеличиваем буфер до 16KB
 	retries := 0
-	maxRetries := 3
+	maxRetries := 5
 
 	for {
 		n, err := ptmx.Read(buf)
@@ -265,6 +273,15 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 					t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
 					break
 				}
+			} else if strings.Contains(err.Error(), "resource temporarily unavailable") {
+				// Ошибка EAGAIN/EWOULDBLOCK - продолжаем работу
+				log.Printf("PTY временная ошибка: %v", err)
+				time.Sleep(10 * time.Millisecond)
+				continue
+			} else if strings.Contains(err.Error(), "interrupted system call") {
+				// Ошибка EINTR - продолжаем работу
+				log.Printf("PTY прерванная системная вызов: %v", err)
+				continue
 			} else {
 				log.Printf("Ошибка чтения из PTY: %v", err)
 				// Для других ошибок показываем сообщение пользователю
@@ -277,6 +294,7 @@ func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
 		retries = 0
 
 		if n > 0 {
+			log.Printf("Получено %d байт данных из PTY", n)
 			output := buf[:n]
 
 			// Конвертируем в строку с обработкой UTF-8
@@ -1616,31 +1634,60 @@ func (t *Terminal) expandEnvVars(input string) string {
 }
 
 func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
+	// writeWithRetry пытается записать данные в PTY с повторными попытками при ошибках
+	writeWithRetry := func(data []byte) {
+		maxRetries := 3
+		for i := 0; i < maxRetries; i++ {
+			_, err := t.ptmx.Write(data)
+			if err == nil {
+				return // Успешно записано
+			}
+			log.Printf("Ошибка записи в PTY (попытка %d/%d): %v", i+1, maxRetries, err)
+			if i < maxRetries-1 {
+				time.Sleep(10 * time.Millisecond) // Небольшая задержка перед повторной попыткой
+			}
+		}
+		// Если все попытки неудачны, показываем сообщение пользователю
+		t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
+	}
 
 	// Если в режиме PTY, передаем ввод в команду
 	if t.inPtyMode && t.ptmx != nil {
+		// Проверяем, не закрыт ли PTY
+		select {
+		case <-t.ptyClosed:
+			// PTY закрыт, выходим из режима PTY
+			t.inPtyMode = false
+			t.ptmx = nil
+			t.cmd = nil
+			t.ptyClosed = nil
+			return
+		default:
+			// PTY все еще открыт, продолжаем обработку
+		}
+
 		// Если есть приглашение sudo, передаем все вводимые символы в PTY
 		if t.sudoPrompt != "" {
 			switch ev.Key() {
 			case tcell.KeyEnter:
-				t.ptmx.Write([]byte{'\r'})
+				writeWithRetry([]byte{'\r'})
 				// После нажатия Enter очищаем приглашение sudo
 				t.sudoPrompt = ""
 			case tcell.KeyBackspace, tcell.KeyBackspace2:
-				t.ptmx.Write([]byte{'\b'})
+				writeWithRetry([]byte{'\b'})
 			case tcell.KeyRune:
-				t.ptmx.Write([]byte(string(ev.Rune())))
+				writeWithRetry([]byte(string(ev.Rune())))
 			case tcell.KeyCtrlC:
 				// Ctrl+C для отправки сигнала прерывания
 				if t.cmd != nil && t.cmd.Process != nil {
 					t.cmd.Process.Signal(os.Interrupt)
 				} else {
-					t.ptmx.Write([]byte{0x03})
+					writeWithRetry([]byte{0x03})
 				}
 				// Очищаем приглашение sudo при прерывании
 				t.sudoPrompt = ""
 			case tcell.KeyEscape:
-				t.ptmx.Write([]byte{0x1b}) // ESC
+				writeWithRetry([]byte{0x1b}) // ESC
 			default:
 				// Для других клавиш ничего не делаем
 			}
@@ -1656,32 +1703,42 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 				}
 				return
 			}
-			t.ptmx.Write([]byte{0x1b}) // ESC
+			writeWithRetry([]byte{0x1b}) // ESC
 		case tcell.KeyEnter:
-			t.ptmx.Write([]byte{'\r'})
+			writeWithRetry([]byte{'\r'})
 		case tcell.KeyBackspace, tcell.KeyBackspace2:
-			t.ptmx.Write([]byte{'\b'})
+			writeWithRetry([]byte{'\b'})
 		case tcell.KeyTab:
-			t.ptmx.Write([]byte{'\t'})
+			writeWithRetry([]byte{'\t'})
 		case tcell.KeyRune:
-			t.ptmx.Write([]byte(string(ev.Rune())))
+			writeWithRetry([]byte(string(ev.Rune())))
 
 		// Добавляем обработку специальных клавиш для sudo и других интерактивных команд
 		case tcell.KeyCtrlZ:
 			// Ctrl+Z для приостановки процесса
 			if t.cmd != nil && t.cmd.Process != nil {
-				t.cmd.Process.Signal(syscall.SIGTSTP)
+				log.Printf("Отправка сигнала SIGTSTP процессу %d", t.cmd.Process.Pid)
+				err := t.cmd.Process.Signal(syscall.SIGTSTP)
+				if err != nil {
+					log.Printf("Ошибка отправки сигнала SIGTSTP: %v", err)
+				}
 			}
 		case tcell.KeyCtrlC:
 			// Ctrl+C для отправки сигнала прерывания
 			if t.cmd != nil && t.cmd.Process != nil {
-				t.cmd.Process.Signal(os.Interrupt)
+				log.Printf("Отправка сигнала SIGINT процессу %d", t.cmd.Process.Pid)
+				err := t.cmd.Process.Signal(os.Interrupt)
+				if err != nil {
+					log.Printf("Ошибка отправки сигнала SIGINT: %v", err)
+					// Если не удалось отправить сигнал, отправляем напрямую в PTY
+					writeWithRetry([]byte{0x03})
+				}
 			} else {
-				t.ptmx.Write([]byte{0x03})
+				writeWithRetry([]byte{0x03})
 			}
 		case tcell.KeyCtrlD:
 			// Ctrl+D для отправки EOF
-			t.ptmx.Write([]byte{0x04})
+			writeWithRetry([]byte{0x04})
 		}
 		return
 	}
