@@ -11,7 +11,7 @@ import (
 	"os/user"
 	"regexp"
 	"strings"
-	"syscall"
+	// "syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -134,395 +134,225 @@ var ansiBgColors = map[int]tcell.Color{
 	107: tcell.ColorWhite,
 }
 
-func (t *Terminal) processPtyCommand(args []string) []LineSegment {
-	log.Printf("Начало processPtyCommand: %v", args)
+// executeSimpleCommand выполняет простые команды с выводом результата
+func (t *Terminal) executeSimpleCommand(args []string) []LineSegment {
+	log.Printf("🔧 Выполнение простой команды: %v", args)
 
-	// Используем shell для запуска команд
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
-	}
-
-	// Запускаем через shell чтобы поддерживать сложные команды
-	cmd := exec.Command(shell, "-c", strings.Join(args, " "))
-
-	// Наследуем все переменные окружения
-	cmd.Env = os.Environ()
-
-	// Добавляем правильные TERM и цвета
-	cmd.Env = append(cmd.Env,
-		"TERM=xterm-256color",
-		"COLORTERM=truecolor",
-		"LANG=en_US.UTF-8",
-		"LC_ALL=en_US.UTF-8",
-	)
-
-	// Добавляем наши кастомные переменные
-	for name, value := range t.envVars {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", name, value))
-	}
-
-	// Получаем размер терминала
-	width, height := t.screen.Size()
-	log.Printf("Размер терминала: %dx%d", width, height)
-
-	// Создаем PTY с правильными размерами
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Rows: uint16(height - 4), // Учитываем отступы
-		Cols: uint16(width - 4),
-	})
+	cmd := exec.Command(args[0], args[1:]...)
+	output, err := cmd.CombinedOutput()
 
 	if err != nil {
-		log.Printf("Ошибка создания PTY: %v", err)
-		return []LineSegment{{Text: fmt.Sprintf("Ошибка: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка: %s\n%s", err, string(output)), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
 	}
 
-	log.Printf("PTY успешно создан, команда запущена")
-	t.ptmx = ptmx
+	text := string(output)
+	if text == "" {
+		text = "[Команда выполнена без вывода]"
+	}
+	return []LineSegment{{Text: text, Style: tcell.StyleDefault.Foreground(tcell.ColorWhite)}}
+}
+
+// executeInteractiveCommand выполняет интерактивные команды через pipes
+func (t *Terminal) executeInteractiveCommand(args []string) []LineSegment {
+	log.Printf("🔄 Запуск интерактивной команды: %v", args)
+
+	if len(args) == 0 {
+		return []LineSegment{{Text: "Ошибка: нет команды", Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	// Создаем команду
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+
+	// Создаем pipes для stdin, stdout, stderr
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Printf("❌ Ошибка создания stdin pipe: %v", err)
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка stdin: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("❌ Ошибка создания stdout pipe: %v", err)
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка stdout: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		log.Printf("❌ Ошибка создания stderr pipe: %v", err)
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка stderr: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	// Запускаем команду
+	if err := cmd.Start(); err != nil {
+		log.Printf("❌ Ошибка запуска команды: %v", err)
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка запуска: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	log.Printf("✅ Команда запущена, PID: %d", cmd.Process.Pid)
+
+	// Сохраняем состояние
 	t.cmd = cmd
 	t.inPtyMode = true
-	t.ptyClosed = make(chan struct{})
 
-	// Чтение вывода в фоне
-	go t.handlePtyOutput(ptmx, cmd)
-
-	log.Printf("Завершение processPtyCommand")
-
-	// Запускаем горутину для мониторинга завершения процесса
+	// Обработка stdout
+	// В executeInteractiveCommand обновите обработку stdout:
 	go func() {
-		if cmd.Process != nil {
-			// Ждем завершения процесса
-			_, err := cmd.Process.Wait()
-			if err != nil {
-				log.Printf("Ошибка ожидания завершения процесса: %v", err)
+		defer stdout.Close()
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			text := scanner.Text()
+			log.Printf("📨 STDOUT: %s", text)
+
+			// 🔴 ОБНАРУЖЕНИЕ SUDO PROMPT
+			if strings.Contains(text, "[sudo] password for") ||
+				strings.Contains(text, "Password:") ||
+				strings.Contains(text, "Пароль:") {
+				t.sudoPrompt = text
+				log.Printf("🔐 Обнаружен sudo prompt: %s", text)
 			}
 
-			// Если PTY все еще открыт, закрываем его
-			if t.ptmx != nil && t.ptmx == ptmx {
-				log.Printf("Закрытие PTY после завершения процесса")
-				t.ptmx.Close()
-				t.ptmx = nil
-			}
+			t.addColoredOutputAtBeginning(text+"\n", tcell.StyleDefault.Foreground(tcell.ColorWhite))
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("❌ Ошибка чтения stdout: %v", err)
+		}
+	}()
 
-			// Сигнализируем о закрытии PTY
-			if t.ptyClosed != nil {
-				select {
-				case <-t.ptyClosed:
-					// Канал уже закрыт
-				default:
-					// Канал еще открыт, закрываем его
-					close(t.ptyClosed)
-				}
-				t.ptyClosed = nil
-			}
+	// Обработка stderr
+	go func() {
+		defer stderr.Close()
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			text := scanner.Text()
+			log.Printf("📨 STDERR: %s", text)
+			t.addColoredOutputAtBeginning(text+"\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("❌ Ошибка чтения stderr: %v", err)
+		}
+	}()
+
+	// Сохраняем stdin для использования в handleKeyEvent
+	t.ptmx = stdin.(*os.File)
+
+	// Ожидание завершения в отдельной горутине
+	go func() {
+		err := cmd.Wait()
+		log.Printf("🔚 Команда завершена, ошибка: %v", err)
+		t.inPtyMode = false
+		t.ptmx = nil
+		t.cmd = nil
+		if err == nil {
+			t.addColoredOutputAtBeginning("\n[Команда завершена успешно]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
+		} else {
+			t.addColoredOutputAtBeginning(fmt.Sprintf("\n[Команда завершена с ошибкой: %v]\n", err), tcell.StyleDefault.Foreground(tcell.ColorYellow))
 		}
 	}()
 
 	return []LineSegment{}
 }
-func (t *Terminal) handlePtyOutput(ptmx *os.File, cmd *exec.Cmd) {
-	log.Printf("Начало handlePtyOutput")
-	defer func() {
-		log.Printf("Завершение PTY goroutine")
 
-		// Закрываем PTY только если он еще не закрыт
-		if t.ptmx != nil {
-			// Проверяем, что это тот же PTY, который мы создали
-			if t.ptmx == ptmx {
-				log.Printf("Закрытие PTY")
-				err := t.ptmx.Close()
-				if err != nil {
-					log.Printf("Ошибка закрытия PTY: %v", err)
-				}
-				t.ptmx = nil
+// addColoredOutputAtBeginning добавляет вывод в НАЧАЛО outputLines
+// addColoredOutputAtBeginning добавляет вывод в НАЧАЛО outputLines с правильным порядком строк
+// addColoredOutputAtBeginning добавляет вывод в НАЧАЛО outputLines (как в оригинале)
+func (t *Terminal) addColoredOutputAtBeginning(text string, baseStyle tcell.Style) {
+	segments := parseANSI(text, baseStyle)
+
+	// Создаем новый слайс и добавляем новые сегменты ПЕРВЫМИ
+	newOutput := []LineSegment{}
+
+	// Добавляем новые сегменты
+	for _, segment := range segments {
+		// Разбиваем на строки если есть переносы
+		lines := strings.Split(segment.Text, "\n")
+		for i, line := range lines {
+			if i > 0 {
+				// Добавляем явный перенос строки между частями
+				newOutput = append(newOutput, LineSegment{Text: "\n", Style: segment.Style})
+			}
+			newOutput = append(newOutput, LineSegment{Text: line, Style: segment.Style})
+		}
+	}
+
+	// Добавляем весь старый вывод ПОСЛЕ новых сегментов
+	newOutput = append(newOutput, t.outputLines...)
+
+	// Заменяем старый вывод на новый
+	t.outputLines = newOutput
+}
+func (t *Terminal) processPtyCommand(args []string) []LineSegment {
+	log.Printf("🎯 Обработка команды: %v", args)
+
+	if len(args) == 0 {
+		return []LineSegment{{Text: "Ошибка: нет команды", Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	// Определяем тип команды
+	command := args[0]
+
+	// Интерактивные команды выполняем через pipes
+	interactiveCommands := map[string]bool{
+		"vim": true, "nano": true, "htop": true, "top": true,
+		"less": true, "more": true, "man": true, "cat": true,
+		"python": true, "python3": true, "bash": true, "sh": true,
+		"zsh": true, "fish": true,
+	}
+
+	if interactiveCommands[command] {
+		return t.executeInteractiveCommand(args)
+	}
+
+	// Простые команды выполняем напрямую
+	return t.executeSimpleCommand(args)
+}
+
+// executeWithRealTTY использует настоящий PTY для команд, которым это нужно
+func (t *Terminal) executeWithRealTTY(args []string) []LineSegment {
+	log.Printf("🔧 Запуск с настоящим TTY: %v", args)
+
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, "TERM=xterm-256color")
+
+	width, height := t.screen.Size()
+
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Rows: uint16(height),
+		Cols: uint16(width),
+	})
+	if err != nil {
+		return []LineSegment{{Text: fmt.Sprintf("Ошибка TTY: %s", err), Style: tcell.StyleDefault.Foreground(tcell.ColorRed)}}
+	}
+
+	t.ptmx = ptmx
+	t.cmd = cmd
+	t.inPtyMode = true
+
+	// Обработка вывода
+	go func() {
+		defer func() {
+			ptmx.Close()
+			t.inPtyMode = false
+			t.ptmx = nil
+			t.cmd = nil
+		}()
+
+		buffer := make([]byte, 1024)
+		for {
+			n, err := ptmx.Read(buffer)
+			if err != nil {
+				break
+			}
+			if n > 0 {
+				output := string(buffer[:n])
+				t.addColoredOutputAtBeginning(output, tcell.StyleDefault.Foreground(tcell.ColorWhite))
 			}
 		}
-		t.inPtyMode = false
-
-		// Ждем завершения процесса с таймаутом
-		if cmd.Process != nil {
-			log.Printf("Ожидание завершения процесса %d", cmd.Process.Pid)
-			done := make(chan error, 1)
-			go func() {
-				_, err := cmd.Process.Wait()
-				done <- err
-			}()
-
-			select {
-			case err := <-done:
-				if err != nil {
-					log.Printf("Ошибка ожидания процесса: %v", err)
-				}
-				// Показываем статус завершения команды
-				if cmd.ProcessState != nil {
-					log.Printf("Процесс завершен: %v", cmd.ProcessState)
-					if cmd.ProcessState.Success() {
-						t.addColoredOutputAtBeginning("\n[Команда завершена успешно]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
-					} else {
-						t.addColoredOutputAtBeginning(fmt.Sprintf("\n[Команда завершена с кодом: %d]\n", cmd.ProcessState.ExitCode()), tcell.StyleDefault.Foreground(tcell.ColorYellow))
-					}
-				} else {
-					// Если ProcessState еще не установлен, но процесс завершен
-					log.Printf("Процесс завершен, но ProcessState еще не доступен")
-					t.addColoredOutputAtBeginning("\n[Команда завершена]\n", tcell.StyleDefault.Foreground(tcell.ColorGreen))
-				}
-			case <-time.After(5 * time.Second):
-				log.Printf("Таймаут ожидания завершения процесса")
-				t.addColoredOutputAtBeginning("\n[Таймаут ожидания завершения команды]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
-			}
-		}
-
-		// Сигнализируем о закрытии PTY
-		if t.ptyClosed != nil {
-			log.Printf("Закрытие канала ptyClosed")
-			// Проверяем, не закрыт ли канал уже
-			select {
-			case <-t.ptyClosed:
-				// Канал уже закрыт
-				log.Printf("Канал ptyClosed уже закрыт")
-			default:
-				// Канал еще открыт, закрываем его
-				close(t.ptyClosed)
-			}
-			t.ptyClosed = nil
-		}
-
-		log.Printf("Завершение handlePtyOutput")
 	}()
 
-	buf := make([]byte, 16384) // Увеличиваем буфер до 16KB
-	retries := 0
-	maxRetries := 10
-
-	for {
-		n, err := ptmx.Read(buf)
-		if err != nil {
-			// Проверяем различные типы ошибок
-			if err == io.EOF {
-				log.Printf("PTY вернул EOF")
-				// При EOF проверяем, есть ли еще данные
-				if n > 0 {
-					// Обрабатываем оставшиеся данные
-					output := buf[:n]
-					text := string(output)
-					text = t.filterControlSequences(text)
-					if strings.TrimSpace(text) != "" {
-						t.addColoredOutputAtBeginning(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
-					}
-				}
-				break
-			} else if strings.Contains(err.Error(), "input/output error") {
-				retries++
-				log.Printf("PTY I/O ошибка: %v, попытка %d/%d", err, retries, maxRetries)
-				log.Printf("Состояние PTY: ptmx=%v, cmd=%v, inPtyMode=%v", t.ptmx, t.cmd, t.inPtyMode)
-				if t.cmd != nil && t.cmd.Process != nil {
-					log.Printf("Состояние процесса: pid=%d, exited=%v", t.cmd.Process.Pid, t.cmd.ProcessState)
-				}
-
-				// Проверяем, завершился ли процесс
-				if t.cmd != nil && t.cmd.ProcessState != nil && t.cmd.ProcessState.Exited() {
-					log.Printf("Процесс уже завершен, пропускаем ошибку ввода-вывода")
-					// Если процесс завершен, то ошибка ввода-вывода может быть нормальной
-					break
-				}
-
-				// Проверяем, есть ли активные данные в буфере
-				if n > 0 {
-					log.Printf("Обнаружены данные в буфере (%d байт) перед ошибкой ввода-вывода", n)
-					// Обрабатываем оставшиеся данные перед завершением
-					output := buf[:n]
-					text := string(output)
-					text = t.filterControlSequences(text)
-					if strings.TrimSpace(text) != "" {
-						t.addColoredOutputAtBeginning(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
-					}
-					// После обработки данных выходим, так как ошибка может быть нормальной
-					break
-				}
-
-				if retries < maxRetries {
-					// Небольшая задержка перед повторной попыткой
-					time.Sleep(100 * time.Millisecond)
-					continue
-				} else {
-					log.Printf("Превышено максимальное количество попыток чтения из PTY")
-					// Проверяем, были ли получены какие-либо данные
-					if len(t.outputLines) == 0 {
-						t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
-					} else {
-						// Если данные были получены, то ошибка может быть не критичной
-						log.Printf("Данные были получены, ошибка ввода-вывода может быть проигнорирована")
-					}
-					break
-				}
-			} else if strings.Contains(err.Error(), "resource temporarily unavailable") {
-				// Ошибка EAGAIN/EWOULDBLOCK - продолжаем работу
-				log.Printf("PTY временная ошибка: %v", err)
-				time.Sleep(10 * time.Millisecond)
-				continue
-			} else if strings.Contains(err.Error(), "interrupted system call") {
-				// Ошибка EINTR - продолжаем работу
-				log.Printf("PTY прерванная системная вызов: %v", err)
-				continue
-			} else {
-				log.Printf("Ошибка чтения из PTY: %v", err)
-				// Для других ошибок показываем сообщение пользователю
-				t.addColoredOutputAtBeginning(fmt.Sprintf("\n[Ошибка PTY: %v]\n", err), tcell.StyleDefault.Foreground(tcell.ColorRed))
-				break
-			}
-		}
-
-		// Сбрасываем счетчик повторных попыток при успешном чтении
-		retries = 0
-
-		if n > 0 {
-			log.Printf("Получено %d байт данных из PTY", n)
-			output := buf[:n]
-
-			// Конвертируем в строку с обработкой UTF-8
-			text := string(output)
-
-			// Фильтруем управляющие последовательности кроме цветов
-			text = t.filterControlSequences(text)
-
-			// Проверяем, является ли вывод приглашением ввода пароля от sudo
-			if strings.Contains(text, "[sudo] password for") ||
-				strings.Contains(text, "Password:") ||
-				strings.Contains(text, "password for") ||
-				strings.Contains(text, "Пароль:") {
-				// Сохраняем приглашение для отображения в отдельной области
-				t.sudoPrompt = strings.TrimSpace(text)
-			} else if strings.TrimSpace(text) != "" {
-				// Обычный вывод добавляем в основной буфер
-				t.addColoredOutputAtBeginning(text, tcell.StyleDefault.Foreground(tcell.ColorWhite))
-				// Очищаем приглашение sudo, так как это обычный вывод
-				t.sudoPrompt = ""
-			}
-		}
-	}
-}
-func (t *Terminal) filterControlSequences(text string) string {
-	// Оставляем только ANSI цветовые коды и удаляем другие управляющие последовательности
-	re := regexp.MustCompile(`\x1b\[[?0-9;]*[a-zA-Z]`)
-
-	// Разрешаем только определенные последовательности
-	allowed := regexp.MustCompile(`\x1b\[[0-9;]*m`) // Цветовые коды
-
-	// Удаляем неразрешенные последовательности
-	cleaned := re.ReplaceAllStringFunc(text, func(match string) string {
-		if allowed.MatchString(match) {
-			return match // Оставляем цветовые коды
-		}
-		return "" // Удаляем другие последовательности
-	})
-
-	return cleaned
-}
-
-func main() {
-	// Инициализация логирования
-	logFile, err := os.OpenFile("terminal.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Fatal("Не удалось открыть файл лога:", err)
-	}
-	defer logFile.Close()
-	log.SetOutput(logFile)
-
-	os.Setenv("LANG", "en_US.UTF-8")
-	os.Setenv("LC_ALL", "en_US.UTF-8")
-	// Инициализация экрана
-	s, err := tcell.NewScreen()
-	if err != nil {
-		panic(err)
-	}
-	if err := s.Init(); err != nil {
-		panic(err)
-	}
-	defer s.Fini()
-
-	// Создаем терминал
-	term := &Terminal{
-		screen:        s,
-		inputBuffer:   make([]rune, 0),
-		cursorPos:     0,
-		cursorVisible: true,
-		lastBlink:     time.Now(),
-		outputLines:   []LineSegment{},
-		history:       []string{},
-		historyPos:    0,
-		aliases:       make(map[string]string),
-		envVars:       make(map[string]string),
-	}
-
-	// Загружаем историю zsh
-	zshHistory, err := loadZshHistory()
-	if err != nil {
-		// В случае ошибки продолжаем работу без истории zsh
-		fmt.Printf("Предупреждение: не удалось загрузить историю zsh: %v\n", err)
-	} else {
-		term.zshHistory = zshHistory
-	}
-
-	// Загружаем алиасы из .zshrc
-	zshAliases, err := loadZshAliases()
-	if err != nil {
-		// В случае ошибки продолжаем работу без алиасов из .zshrc
-		fmt.Printf("Предупреждение: не удалось загрузить алиасы из .zshrc: %v\n", err)
-	} else {
-		// Копируем алиасы из .zshrc в терминал
-		for alias, command := range zshAliases {
-			term.aliases[alias] = command
-		}
-	}
-
-	// Загружаем алиасы из .termgo_aliases (они будут иметь приоритет)
-	aliases, err := loadAliases()
-	if err != nil {
-		// В случае ошибки продолжаем работу без алиасов из .termgo_aliases
-		fmt.Printf("Предупреждение: не удалось загрузить алиасы из .termgo_aliases: %v\n", err)
-	} else {
-		// Копируем алиасы из .termgo_aliases в терминал (они перезапишут алиасы из .zshrc)
-		for alias, command := range aliases {
-			term.aliases[alias] = command
-		}
-	}
-
-	// Устанавливаем темный стиль
-	defStyle := tcell.StyleDefault.
-		Foreground(tcell.ColorWhite).
-		Background(tcell.ColorDefault)
-	s.SetStyle(defStyle)
-	s.Clear()
-
-	// Главный цикл
-	for {
-		// Обновляем мигание курсора
-		term.updateCursorBlink()
-
-		// Рисуем состояние
-		term.draw()
-
-		// Показываем изменения
-		s.Show()
-
-		// Обработка событий с таймаутом для плавного мигания
-		select {
-		case <-time.After(50 * time.Millisecond):
-			continue
-		default:
-		}
-
-		// Обработка событий ввода
-		if s.HasPendingEvent() {
-			ev := s.PollEvent()
-			switch ev := ev.(type) {
-			case *tcell.EventResize:
-				s.Sync()
-			case *tcell.EventKey:
-				term.handleKeyEvent(ev)
-			}
-		}
-	}
+	return []LineSegment{}
 }
 func decodeWindows1251(data []byte) string {
 	// Пробуем декодировать из Windows-1251 (часто используется в Windows)
@@ -533,6 +363,38 @@ func decodeWindows1251(data []byte) string {
 		return string(data)
 	}
 	return string(decoded)
+}
+
+// handleSudoInput обрабатывает ввод пароля для sudo
+func (t *Terminal) handleSudoInput(ev *tcell.EventKey) {
+	log.Printf("🔐 Обработка sudo ввода: %v", ev.Key())
+
+	switch ev.Key() {
+	case tcell.KeyEnter:
+		// Отправляем Enter в PTY (подтверждаем пароль или пустой пароль)
+		t.ptmx.Write([]byte{'\n'})
+		log.Printf("↵ Enter отправлен в sudo")
+		t.sudoPrompt = "" // Сбрасываем приглашение после ввода
+
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		// Backspace для редактирования пароля
+		t.ptmx.Write([]byte{'\b'})
+		log.Printf("⌫ Backspace в sudo")
+
+	case tcell.KeyRune:
+		// Передаем символы пароля
+		t.ptmx.Write([]byte(string(ev.Rune())))
+		log.Printf("📝 Символ пароля отправлен")
+
+	case tcell.KeyCtrlC:
+		// Ctrl+C для отмены sudo
+		t.ptmx.Write([]byte{0x03})
+		log.Printf("🚫 Ctrl+C - отмена sudo")
+		t.sudoPrompt = ""
+
+	default:
+		log.Printf("❓ Необработанная клавиша в sudo: %v", ev.Key())
+	}
 }
 
 // loadZshHistory загружает историю команд из файла ~/.zsh_history
@@ -702,6 +564,113 @@ func loadAliases() (map[string]string, error) {
 
 	return aliases, nil
 }
+
+func main() {
+	// Инициализация логирования
+	logFile, err := os.OpenFile("terminal.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatal("Не удалось открыть файл лога:", err)
+	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+
+	os.Setenv("LANG", "en_US.UTF-8")
+	os.Setenv("LC_ALL", "en_US.UTF-8")
+	// Инициализация экрана
+	s, err := tcell.NewScreen()
+	if err != nil {
+		panic(err)
+	}
+	if err := s.Init(); err != nil {
+		panic(err)
+	}
+	defer s.Fini()
+
+	// Создаем терминал
+	term := &Terminal{
+		screen:        s,
+		inputBuffer:   make([]rune, 0),
+		cursorPos:     0,
+		cursorVisible: true,
+		lastBlink:     time.Now(),
+		outputLines:   []LineSegment{},
+		history:       []string{},
+		historyPos:    0,
+		aliases:       make(map[string]string),
+		envVars:       make(map[string]string),
+	}
+
+	// Загружаем историю zsh
+	zshHistory, err := loadZshHistory()
+	if err != nil {
+		// В случае ошибки продолжаем работу без истории zsh
+		fmt.Printf("Предупреждение: не удалось загрузить историю zsh: %v\n", err)
+	} else {
+		term.zshHistory = zshHistory
+	}
+
+	// Загружаем алиасы из .zshrc
+	zshAliases, err := loadZshAliases()
+	if err != nil {
+		// В случае ошибки продолжаем работу без алиасов из .zshrc
+		fmt.Printf("Предупреждение: не удалось загрузить алиасы из .zshrc: %v\n", err)
+	} else {
+		// Копируем алиасы из .zshrc в терминал
+		for alias, command := range zshAliases {
+			term.aliases[alias] = command
+		}
+	}
+
+	// Загружаем алиасы из .termgo_aliases (они будут иметь приоритет)
+	aliases, err := loadAliases()
+	if err != nil {
+		// В случае ошибки продолжаем работу без алиасов из .termgo_aliases
+		fmt.Printf("Предупреждение: не удалось загрузить алиасы из .termgo_aliases: %v\n", err)
+	} else {
+		// Копируем алиасы из .termgo_aliases в терминал (они перезапишут алиасы из .zshrc)
+		for alias, command := range aliases {
+			term.aliases[alias] = command
+		}
+	}
+
+	// Устанавливаем темный стиль
+	defStyle := tcell.StyleDefault.
+		Foreground(tcell.ColorWhite).
+		Background(tcell.ColorDefault)
+	s.SetStyle(defStyle)
+	s.Clear()
+
+	// Главный цикл
+	for {
+		// Обновляем мигание курсора
+		term.updateCursorBlink()
+
+		// Рисуем состояние
+		term.draw()
+
+		// Показываем изменения
+		s.Show()
+
+		// Обработка событий с таймаутом для плавного мигания
+		select {
+		case <-time.After(50 * time.Millisecond):
+			continue
+		default:
+		}
+
+		// Обработка событий ввода
+		if s.HasPendingEvent() {
+			ev := s.PollEvent()
+			switch ev := ev.(type) {
+			case *tcell.EventResize:
+				s.Sync()
+			case *tcell.EventKey:
+				term.handleKeyEvent(ev)
+			}
+		}
+	}
+}
+
 func (t *Terminal) updateCursorBlink() {
 	if time.Since(t.lastBlink) > 500*time.Millisecond {
 		t.cursorVisible = !t.cursorVisible
@@ -723,25 +692,39 @@ func (t *Terminal) draw() {
 	// Получаем текущую директорию
 	currentDir, _ := os.Getwd()
 
-	// Формируем строку приглашения с текущей директорией
-	prompt := currentDir + " $ "
-	inputLine := prompt + string(t.inputBuffer)
+	// 🔴 ОСОБЫЙ ПРОМПТ ДЛЯ SUDO
+	var prompt string
+	if t.sudoPrompt != "" {
+		prompt = "[SUDO PASSWORD] "
+		// Скрываем ввод для пароля
+		inputLine := prompt + strings.Repeat("*", len(t.inputBuffer))
+		t.drawText(offsetX, offsetY+1, inputLine, tcell.StyleDefault.
+			Foreground(tcell.ColorYellow).Background(tcell.ColorDefault))
+	} else {
+		prompt = currentDir + " $ "
+		inputLine := prompt + string(t.inputBuffer)
+		t.drawText(offsetX, offsetY+1, inputLine, tcell.StyleDefault.
+			Foreground(tcell.ColorWhite).Background(tcell.ColorDefault))
+	}
 
 	inputY := offsetY + 1
 	t.drawOutput(offsetX, inputY+1, termWidth, termHeight-2)
 
-	// Рисуем текст
-	t.drawText(offsetX, inputY, inputLine, tcell.StyleDefault.
-		Foreground(tcell.ColorWhite).
-		Background(tcell.ColorDefault))
+	// 🔴 ОТОБРАЖЕНИЕ SUDO PROMPT
+	if t.sudoPrompt != "" {
+		t.drawText(offsetX, inputY, t.sudoPrompt, tcell.StyleDefault.
+			Foreground(tcell.ColorRed).Background(tcell.ColorDefault))
+	}
 
-	// Курсор - правильное вычисление позиции для кириллицы
+	// Курсор
 	prefix := prompt
-	cursorX := offsetX + len([]rune(prefix)) + t.cursorPos // Используем руны для префикса
+	cursorX := offsetX + len([]rune(prefix)) + t.cursorPos
 
 	if t.cursorVisible {
 		t.drawCursor(cursorX, inputY)
 	}
+
+	// ... остальная логика отрисовки
 
 	// Отображаем приглашение sudo, если оно есть
 	sudoPromptY := inputY + 1
@@ -1125,6 +1108,8 @@ func applyANSICodes(codes []int, baseStyle tcell.Style) tcell.Style {
 
 func (t *Terminal) addColoredOutput(text string, baseStyle tcell.Style) {
 	segments := parseANSI(text, baseStyle)
+
+	// 🔴 ПРОСТО ДОБАВЛЯЕМ В КОНЕЦ - ДЛЯ ИНТЕРАКТИВНЫХ КОМАНД
 	for _, segment := range segments {
 		// Разбиваем на строки если есть переносы
 		lines := strings.Split(segment.Text, "\n")
@@ -1136,33 +1121,6 @@ func (t *Terminal) addColoredOutput(text string, baseStyle tcell.Style) {
 			t.outputLines = append(t.outputLines, LineSegment{Text: line, Style: segment.Style})
 		}
 	}
-}
-
-// addColoredOutputAtBeginning добавляет цветной вывод в НАЧАЛО outputLines
-func (t *Terminal) addColoredOutputAtBeginning(text string, baseStyle tcell.Style) {
-	segments := parseANSI(text, baseStyle)
-
-	// Создаем новый слайс и добавляем новые сегменты ПЕРВЫМИ
-	newOutput := []LineSegment{}
-
-	// Добавляем новые сегменты
-	for _, segment := range segments {
-		// Разбиваем на строки если есть переносы
-		lines := strings.Split(segment.Text, "\n")
-		for i, line := range lines {
-			if i > 0 {
-				// Добавляем явный перенос строки между частями
-				newOutput = append(newOutput, LineSegment{Text: "\n", Style: segment.Style})
-			}
-			newOutput = append(newOutput, LineSegment{Text: line, Style: segment.Style})
-		}
-	}
-
-	// Добавляем весь старый вывод ПОСЛЕ новых сегментов
-	newOutput = append(newOutput, t.outputLines...)
-
-	// Заменяем старый вывод на новый
-	t.outputLines = newOutput
 }
 
 func (t *Terminal) expandAliases(cmd string) string {
@@ -1236,6 +1194,7 @@ func (t *Terminal) executeCommand(cmd string) {
 	t.completionIndex = 0
 	t.completionScrollOffset = 0
 }
+
 func (t *Terminal) processCommand(cmd string) []LineSegment {
 	args := t.parseArgs(cmd)
 	if len(args) == 0 {
@@ -1304,6 +1263,7 @@ func (t *Terminal) processCommand(cmd string) []LineSegment {
 
 	return segments
 }
+
 func (t *Terminal) processLsCommand(args []string) []LineSegment {
 	dir := "."
 	longFormat := false
@@ -1716,161 +1676,109 @@ func (t *Terminal) expandEnvVars(input string) string {
 }
 
 func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
-	// writeWithRetry пытается записать данные в PTY с повторными попытками при ошибках
-	writeWithRetry := func(data []byte) {
-		maxRetries := 5
-		for i := 0; i < maxRetries; i++ {
-			// Проверяем состояние PTY перед записью
-			if t.ptmx == nil {
-				log.Printf("Попытка записи в nil PTY (попытка %d/%d)", i+1, maxRetries)
-				t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY: PTY закрыт]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
-				return
-			}
-
-			_, err := t.ptmx.Write(data)
-			if err == nil {
-				return // Успешно записано
-			}
-			log.Printf("Ошибка записи в PTY (попытка %d/%d): %v", i+1, maxRetries, err)
-			log.Printf("Состояние PTY: ptmx=%v, cmd=%v, inPtyMode=%v", t.ptmx, t.cmd, t.inPtyMode)
-			if t.cmd != nil && t.cmd.Process != nil {
-				log.Printf("Состояние процесса: pid=%d, exited=%v", t.cmd.Process.Pid, t.cmd.ProcessState)
-			}
-			if i < maxRetries-1 {
-				time.Sleep(50 * time.Millisecond) // Небольшая задержка перед повторной попыткой
-			}
-		}
-		// Если все попытки неудачны, показываем сообщение пользователю
-		t.addColoredOutputAtBeginning("\n[Ошибка ввода-вывода PTY]\n", tcell.StyleDefault.Foreground(tcell.ColorRed))
-	}
-
-	// Если в режиме PTY, передаем ввод в команду
-	if t.inPtyMode && t.ptmx != nil {
-		// Проверяем, не закрыт ли PTY
-		select {
-		case <-t.ptyClosed:
-			// PTY закрыт, выходим из режима PTY
-			log.Printf("PTY закрыт через канал ptyClosed")
+	// 🔴 АВАРИЙНЫЙ ВЫХОД ИЗ ЛЮБОГО РЕЖИМА
+	if ev.Key() == tcell.KeyCtrlQ {
+		log.Printf("🚨 Аварийный выход по Ctrl+Q")
+		if t.inPtyMode && t.cmd != nil && t.cmd.Process != nil {
+			log.Printf("⚡ Принудительное завершение процесса %d", t.cmd.Process.Pid)
+			t.cmd.Process.Kill()
 			t.inPtyMode = false
 			t.ptmx = nil
 			t.cmd = nil
-			t.ptyClosed = nil
-			return
-		default:
-			// PTY все еще открыт, продолжаем обработку
-		}
-
-		// Дополнительная проверка состояния PTY
-		if t.ptmx == nil {
-			log.Printf("PTY стал nil во время обработки")
-			t.inPtyMode = false
-			t.cmd = nil
-			t.ptyClosed = nil
-			return
-		}
-
-		// Проверяем состояние процесса
-		if t.cmd != nil && t.cmd.Process != nil {
-			// Проверяем, завершился ли процесс
-			if t.cmd.ProcessState != nil && t.cmd.ProcessState.Exited() {
-				log.Printf("Процесс уже завершен: %v", t.cmd.ProcessState)
-				// Закрываем PTY и выходим из режима PTY
-				if t.ptmx != nil {
-					t.ptmx.Close()
-					t.ptmx = nil
-				}
-				t.inPtyMode = false
-				t.cmd = nil
-				if t.ptyClosed != nil {
-					close(t.ptyClosed)
-					t.ptyClosed = nil
-				}
-				return
-			}
-		}
-
-		// Если есть приглашение sudo, передаем все вводимые символы в PTY
-		if t.sudoPrompt != "" {
-			switch ev.Key() {
-			case tcell.KeyEnter:
-				writeWithRetry([]byte{'\r'})
-				// После нажатия Enter очищаем приглашение sudo
-				t.sudoPrompt = ""
-			case tcell.KeyBackspace, tcell.KeyBackspace2:
-				writeWithRetry([]byte{'\b'})
-			case tcell.KeyRune:
-				writeWithRetry([]byte(string(ev.Rune())))
-			case tcell.KeyCtrlC:
-				// Ctrl+C для отправки сигнала прерывания
-				if t.cmd != nil && t.cmd.Process != nil {
-					t.cmd.Process.Signal(os.Interrupt)
-				} else {
-					writeWithRetry([]byte{0x03})
-				}
-				// Очищаем приглашение sudo при прерывании
-				t.sudoPrompt = ""
-			case tcell.KeyEscape:
-				writeWithRetry([]byte{0x1b}) // ESC
-			default:
-				// Для других клавиш ничего не делаем
-			}
-			return
-		}
-
-		switch ev.Key() {
-		case tcell.KeyEscape:
-			if ev.Modifiers() == tcell.ModCtrl {
-				// Ctrl+C для отправки сигнала прерывания
-				if t.cmd != nil && t.cmd.Process != nil {
-					t.cmd.Process.Signal(os.Interrupt)
-				}
-				return
-			}
-			writeWithRetry([]byte{0x1b}) // ESC
-		case tcell.KeyEnter:
-			writeWithRetry([]byte{'\r'})
-		case tcell.KeyBackspace, tcell.KeyBackspace2:
-			writeWithRetry([]byte{'\b'})
-		case tcell.KeyTab:
-			writeWithRetry([]byte{'\t'})
-		case tcell.KeyRune:
-			writeWithRetry([]byte(string(ev.Rune())))
-
-		// Добавляем обработку специальных клавиш для sudo и других интерактивных команд
-		case tcell.KeyCtrlZ:
-			// Ctrl+Z для приостановки процесса
-			if t.cmd != nil && t.cmd.Process != nil {
-				log.Printf("Отправка сигнала SIGTSTP процессу %d", t.cmd.Process.Pid)
-				err := t.cmd.Process.Signal(syscall.SIGTSTP)
-				if err != nil {
-					log.Printf("Ошибка отправки сигнала SIGTSTP: %v", err)
-				}
-			}
-		case tcell.KeyCtrlC:
-			// Ctrl+C для отправки сигнала прерывания
-			if t.cmd != nil && t.cmd.Process != nil {
-				log.Printf("Отправка сигнала SIGINT процессу %d", t.cmd.Process.Pid)
-				err := t.cmd.Process.Signal(os.Interrupt)
-				if err != nil {
-					log.Printf("Ошибка отправки сигнала SIGINT: %v", err)
-					// Если не удалось отправить сигнал, отправляем напрямую в PTY
-					writeWithRetry([]byte{0x03})
-				}
-			} else {
-				writeWithRetry([]byte{0x03})
-			}
-		case tcell.KeyCtrlD:
-			// Ctrl+D для отправки EOF
-			writeWithRetry([]byte{0x04})
 		}
 		return
 	}
-	switch ev.Key() {
-	case tcell.KeyCtrlC:
-		t.screen.Fini()
-		os.Exit(0)
 
-	case tcell.KeyCtrlQ:
+	if ev.Key() == tcell.KeyCtrlC && ev.Modifiers()&tcell.ModCtrl != 0 {
+		log.Printf("🚨 Глобальный Ctrl+C")
+		if t.inPtyMode && t.cmd != nil && t.cmd.Process != nil {
+			t.cmd.Process.Signal(os.Interrupt)
+		}
+		return
+	}
+
+	// 🔴 ПРОСТАЯ логика для PTY режима
+	if t.inPtyMode && t.ptmx != nil {
+		log.Printf("⌨️  PTY режим - клавиша: %v, Rune: %q, Modifiers: %v", ev.Key(), ev.Rune(), ev.Modifiers())
+
+		// 🔴 ПЕРВЫЕ ПРОВЕРЯЕМ SUDO
+		if t.sudoPrompt != "" {
+			t.handleSudoInput(ev)
+			return
+		}
+
+		// 🔴 ОБРАБОТКА КОМБИНАЦИЙ С ALT ПЕРВОЙ
+		if ev.Modifiers()&tcell.ModAlt != 0 {
+			switch ev.Key() {
+			case tcell.KeyF4:
+				t.ptmx.Write([]byte{0x1b, 'O', 'S'}) // Alt+F4
+				log.Printf("🔑 Отправлен Alt+F4")
+				return
+			}
+		}
+
+		switch ev.Key() {
+		case tcell.KeyRune:
+			t.ptmx.Write([]byte(string(ev.Rune())))
+
+		case tcell.KeyEnter:
+			t.ptmx.Write([]byte{'\n'})
+
+		case tcell.KeyBackspace, tcell.KeyBackspace2:
+			t.ptmx.Write([]byte{'\b'})
+
+		case tcell.KeyTab:
+			t.ptmx.Write([]byte{'\t'})
+
+		case tcell.KeyEscape:
+			t.ptmx.Write([]byte{0x1b})
+
+		case tcell.KeyCtrlC:
+			t.ptmx.Write([]byte{0x03}) // Ctrl+C
+
+		case tcell.KeyCtrlD:
+			t.ptmx.Write([]byte{0x04}) // Ctrl+D (EOF)
+
+		case tcell.KeyCtrlZ:
+			t.ptmx.Write([]byte{0x1a}) // Ctrl+Z (suspend)
+
+		// 🔴 ФУНКЦИОНАЛЬНЫЕ КЛАВИШИ
+		case tcell.KeyF1:
+			t.ptmx.Write([]byte{0x1b, 'O', 'P'}) // F1
+		case tcell.KeyF2:
+			t.ptmx.Write([]byte{0x1b, 'O', 'Q'}) // F2
+		case tcell.KeyF3:
+			t.ptmx.Write([]byte{0x1b, 'O', 'R'}) // F3
+		case tcell.KeyF4:
+			t.ptmx.Write([]byte{0x1b, 'O', 'S'}) // F4
+		case tcell.KeyF5:
+			t.ptmx.Write([]byte{0x1b, '[', '1', '5', '~'}) // F5
+		case tcell.KeyF6:
+			t.ptmx.Write([]byte{0x1b, '[', '1', '7', '~'}) // F6
+		case tcell.KeyF7:
+			t.ptmx.Write([]byte{0x1b, '[', '1', '8', '~'}) // F7
+		case tcell.KeyF8:
+			t.ptmx.Write([]byte{0x1b, '[', '1', '9', '~'}) // F8
+		case tcell.KeyF9:
+			t.ptmx.Write([]byte{0x1b, '[', '2', '0', '~'}) // F9
+		case tcell.KeyF10:
+			t.ptmx.Write([]byte{0x1b, '[', '2', '1', '~'}) // F10
+		case tcell.KeyF11:
+			t.ptmx.Write([]byte{0x1b, '[', '2', '3', '~'}) // F11
+		case tcell.KeyF12:
+			t.ptmx.Write([]byte{0x1b, '[', '2', '4', '~'}) // F12
+
+		default:
+			log.Printf("❓ Необработанная клавиша в PTY: %v", ev.Key())
+		}
+		return
+	}
+
+	// ... остальная логика для НЕ-PTY режима
+
+	// Обработка клавиш в НЕ-PTY режиме
+	switch ev.Key() {
+	case tcell.KeyCtrlC, tcell.KeyCtrlQ:
 		t.screen.Fini()
 		os.Exit(0)
 
@@ -1917,7 +1825,7 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 				t.cursorPos = 0
 			}
 		}
-	// Добавьте в switch-case в handleKeyEvent:
+
 	case tcell.KeyPgUp:
 		// Если отображается список автодополнения, прокручиваем его
 		if len(t.completionMatches) > 0 {
@@ -1926,6 +1834,7 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 			// Иначе прокручиваем основной вывод
 			t.scrollOffset += 5
 		}
+
 	case tcell.KeyPgDn:
 		// Если отображается список автодополнения, прокручиваем его
 		if len(t.completionMatches) > 0 {
@@ -1938,6 +1847,7 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 			// Иначе прокручиваем основной вывод
 			t.scrollOffset = max(0, t.scrollOffset-5)
 		}
+
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if t.cursorPos > 0 && len(t.inputBuffer) > 0 {
 			t.inputBuffer = append(t.inputBuffer[:t.cursorPos-1], t.inputBuffer[t.cursorPos:]...)
@@ -1979,8 +1889,6 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 					t.completionScrollOffset = t.completionIndex - 9
 				}
 			}
-			// Если достигли конца списка, курсор остается на последнем элементе
-
 			// Применяем текущий элемент из списка автодополнения к вводу
 			if t.completionIndex < len(t.completionMatches) {
 				currentMatch := t.completionMatches[t.completionIndex]
@@ -2002,8 +1910,6 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 					t.completionScrollOffset = t.completionIndex
 				}
 			}
-			// Если достигли начала списка, курсор остается на первом элементе
-
 			// Применяем текущий элемент из списка автодополнения к вводу
 			if t.completionIndex < len(t.completionMatches) {
 				currentMatch := t.completionMatches[t.completionIndex]
@@ -2031,6 +1937,7 @@ func max(a, b int) int {
 	}
 	return b
 }
+
 func (t *Terminal) insertRune(r rune) {
 	// Вставляем руну правильно
 	if t.cursorPos == len(t.inputBuffer) {
