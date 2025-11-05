@@ -952,7 +952,7 @@ func (t *Terminal) drawCompletionList(offsetX, offsetY, maxWidth int) {
 		var style tcell.Style
 		if startIndex+i == t.completionIndex {
 			style = tcell.StyleDefault.
-				Foreground(tcell.ColorWhite).
+				Foreground(tcell.ColorBlack).
 				Background(tcell.ColorGray)
 		} else {
 			style = tcell.StyleDefault.
