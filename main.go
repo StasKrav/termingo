@@ -32,6 +32,8 @@ type Terminal struct {
 	zshHistory           []string      // История команд из zsh
 	completionSuggestion string        // Текст подсказки (серая часть)
 	suggestionStyle      tcell.Style
+	completionMatches    []string // Все найденные варианты ← ДОБАВЛЯЕМ
+	completionIndex      int
 	ptmx                 *os.File
 	cmd                  *exec.Cmd
 	inPtyMode            bool
@@ -40,6 +42,7 @@ type Terminal struct {
 	aliases              map[string]string // Алиасы команд
 	envVars              map[string]string // Переменные окружения
 	ptyClosed            chan struct{}     // Канал для сигнализации о закрытии PTY
+
 }
 
 // parseArgs разбирает команду на аргументы с учетом кавычек
@@ -253,8 +256,6 @@ func (t *Terminal) executeInteractiveCommand(args []string) []LineSegment {
 	return []LineSegment{}
 }
 
-// addColoredOutputAtBeginning добавляет вывод в НАЧАЛО outputLines
-// addColoredOutputAtBeginning добавляет вывод в НАЧАЛО outputLines с правильным порядком строк
 // addColoredOutputAtBeginning добавляет вывод в НАЧАЛО outputLines (как в оригинале)
 func (t *Terminal) addColoredOutputAtBeginning(text string, baseStyle tcell.Style) {
 	segments := parseANSI(text, baseStyle)
@@ -599,6 +600,8 @@ func main() {
 		envVars:              make(map[string]string),
 		completionSuggestion: "",
 		suggestionStyle:      tcell.StyleDefault.Foreground(tcell.ColorGray),
+		completionMatches:    []string{}, // ← ДОБАВЛЯЕМ
+		completionIndex:      0,
 	}
 
 	// Загружаем историю zsh
@@ -673,43 +676,63 @@ func main() {
 }
 
 // updateCompletionSuggestion ищет наиболее подходящую подсказку из истории
+// updateCompletionSuggestion обновляет подсказку на основе текущего ввода
 func (t *Terminal) updateCompletionSuggestion() {
 	if len(t.inputBuffer) == 0 {
 		t.completionSuggestion = ""
+		t.completionMatches = []string{}
+		t.completionIndex = 0
 		return
 	}
 
 	currentInput := string(t.inputBuffer)
-	t.completionSuggestion = t.findBestSuggestion(currentInput)
+
+	// Находим все совпадения
+	t.completionMatches = t.findAllSuggestions(currentInput)
+
+	if len(t.completionMatches) == 0 {
+		t.completionSuggestion = ""
+		t.completionIndex = 0
+		return
+	}
+
+	// Убедимся что индекс в пределах
+	if t.completionIndex >= len(t.completionMatches) {
+		t.completionIndex = 0
+	}
+
+	// Устанавливаем текущую подсказку
+	t.completionSuggestion = t.completionMatches[t.completionIndex][len(currentInput):]
 }
 
-// findBestSuggestion находит лучшую подсказку из истории
-func (t *Terminal) findBestSuggestion(currentInput string) string {
-	var bestMatch string
-	var bestScore int
+// findAllSuggestions находит все подходящие команды из истории
+func (t *Terminal) findAllSuggestions(currentInput string) []string {
+	var matches []string
+	seen := make(map[string]bool)
 
-	// Сначала ищем в обычной истории (более высший приоритет)
+	// Ищем в обычной истории (приоритет выше)
 	for i := len(t.history) - 1; i >= 0; i-- {
 		cmd := t.history[i]
-		if score := t.calculateMatchScore(cmd, currentInput); score > bestScore {
-			bestMatch = cmd
-			bestScore = score
+		if strings.HasPrefix(cmd, currentInput) && cmd != currentInput {
+			if !seen[cmd] {
+				matches = append(matches, cmd)
+				seen[cmd] = true
+			}
 		}
 	}
 
-	// Затем в zsh истории
+	// Ищем в zsh истории
 	for i := len(t.zshHistory) - 1; i >= 0; i-- {
 		cmd := t.zshHistory[i]
-		if score := t.calculateMatchScore(cmd, currentInput); score > bestScore {
-			bestMatch = cmd
-			bestScore = score
+		if strings.HasPrefix(cmd, currentInput) && cmd != currentInput {
+			if !seen[cmd] {
+				matches = append(matches, cmd)
+				seen[cmd] = true
+			}
 		}
 	}
 
-	if bestMatch != "" {
-		return bestMatch[len(currentInput):] // Возвращаем только дополняющую часть
-	}
-	return ""
+	return matches
 }
 
 // calculateMatchScore вычисляет релевантность совпадения
@@ -916,101 +939,6 @@ func (t *Terminal) drawCursor(x, y int) {
 	// Используем пробел для курсора вместо символа
 	t.screen.SetContent(x, y, ' ', nil, style)
 }
-
-// // drawCompletionList отображает список вариантов автодополнения
-// func (t *Terminal) drawCompletionList(offsetX, offsetY, maxWidth int) {
-// 	if len(t.completionMatches) == 0 {
-// 		return
-// 	}
-//
-// 	// Ограничиваем количество отображаемых вариантов
-// 	maxVisible := 10
-//
-// 	// Применяем смещение скролла
-// 	startIndex := t.completionScrollOffset
-// 	if startIndex >= len(t.completionMatches) {
-// 		startIndex = 0
-// 		t.completionScrollOffset = 0
-// 	}
-//
-// 	// Определяем конечный индекс
-// 	endIndex := startIndex + maxVisible
-// 	if endIndex > len(t.completionMatches) {
-// 		endIndex = len(t.completionMatches)
-// 	}
-//
-// 	// Получаем подмножество вариантов для отображения
-// 	matchesToShow := t.completionMatches[startIndex:endIndex]
-//
-// 	// Рисуем темный фон
-// 	backgroundStyle := tcell.StyleDefault.
-// 		Foreground(tcell.ColorWhite).
-// 		Background(tcell.ColorBlack)
-//
-// 	// Получаем размеры экрана
-// 	screenWidth, screenHeight := t.screen.Size()
-//
-// 	// Рисуем фон
-// 	visibleHeight := len(matchesToShow)
-// 	for i := 0; i < visibleHeight && offsetY+i < screenHeight-1; i++ {
-// 		for j := 0; j < maxWidth && offsetX+j < screenWidth-1; j++ {
-// 			// Фон
-// 			t.screen.SetContent(offsetX+j, offsetY+i, ' ', nil, backgroundStyle)
-// 		}
-// 	}
-//
-// 	// Отображаем каждый вариант
-// 	for i, match := range matchesToShow {
-// 		y := offsetY + i
-// 		x := offsetX + 1
-//
-// 		// Создаем текст с индикатором текущего выбора
-// 		var text string
-// 		if startIndex+i == t.completionIndex {
-// 			text = "> " + match
-// 		} else {
-// 			text = "  " + match
-// 		}
-//
-// 		// Ограничиваем длину текста шириной терминала
-// 		if len([]rune(text)) > maxWidth-2 { // -2 для учета отступа
-// 			runes := []rune(text)
-// 			text = string(runes[:maxWidth-5]) + "..." // -5 для учета отступа и "..."
-// 		}
-//
-// 		// Выбираем стиль в зависимости от того, является ли это текущим выбором
-// 		var style tcell.Style
-// 		if startIndex+i == t.completionIndex {
-// 			style = tcell.StyleDefault.
-// 				Foreground(tcell.ColorBlack).
-// 				Background(tcell.ColorGray)
-// 		} else {
-// 			style = tcell.StyleDefault.
-// 				Foreground(tcell.ColorGray).
-// 				Background(tcell.ColorBlack)
-// 		}
-//
-// 		// Отображаем текст
-// 		t.drawText(x, y, text, style)
-// 	}
-//
-// 	// Если есть еще варианты, отображаем индикатор прокрутки
-// 	if len(t.completionMatches) > maxVisible {
-// 		// Отображаем индикатор прокрутки в правом нижнем углу списка
-// 		scrollIndicator := fmt.Sprintf("[%d/%d]",
-// 			startIndex/maxVisible+1,
-// 			(len(t.completionMatches)+maxVisible-1)/maxVisible)
-//
-// 		indicatorStyle := tcell.StyleDefault.
-// 			Foreground(tcell.ColorYellow).
-// 			Background(tcell.ColorBlack)
-//
-// 		t.drawText(offsetX+maxWidth-len([]rune(scrollIndicator))-1, // -1 для учета отступа
-// 			offsetY+len(matchesToShow)-1, // -1 для учета отступа
-// 			scrollIndicator,
-// 			indicatorStyle)
-// 	}
-// }
 
 // parseANSI преобразует строку с ANSI кодами в сегменты с правильными стилями
 func parseANSI(text string, baseStyle tcell.Style) []LineSegment {
@@ -1236,10 +1164,11 @@ func (t *Terminal) executeCommand(cmd string) {
 	t.history = append(t.history, cmd)
 	t.historyPos = len(t.history)
 
+	// Очищаем подсказки
+	t.completionSuggestion = ""
+	t.completionMatches = []string{}
+	t.completionIndex = 0
 	// Очищаем список автодополнения
-	// t.completionMatches = make([]string, 0)
-	// t.completionIndex = 0
-	// t.completionScrollOffset = 0
 }
 
 func (t *Terminal) processCommand(cmd string) []LineSegment {
@@ -1900,9 +1829,26 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		}
 
 	case tcell.KeyRight:
-		if t.cursorPos < len(t.inputBuffer) {
+		if t.cursorPos == len(t.inputBuffer) && t.completionSuggestion != "" {
+			// Принимаем следующее слово из подсказки
+			remainingSuggestion := t.completionSuggestion
+			var wordToAdd string
+
+			// Ищем первое слово или до конца если нет пробелов
+			if spaceIndex := strings.Index(remainingSuggestion, " "); spaceIndex != -1 {
+				wordToAdd = remainingSuggestion[:spaceIndex+1] // включая пробел
+			} else {
+				wordToAdd = remainingSuggestion // всё что осталось
+			}
+
+			t.inputBuffer = append(t.inputBuffer, []rune(wordToAdd)...)
+			t.cursorPos = len(t.inputBuffer)
+			t.completionSuggestion = remainingSuggestion[len(wordToAdd):]
+		} else if t.cursorPos < len(t.inputBuffer) {
+			// Обычное поведение - перемещение курсора вправо
 			t.cursorPos++
 		}
+		// Если курсор в конце и нет подсказки - ничего не делаем
 
 	case tcell.KeyHome:
 		t.cursorPos = 0
@@ -1911,13 +1857,21 @@ func (t *Terminal) handleKeyEvent(ev *tcell.EventKey) {
 		t.cursorPos = len(t.inputBuffer)
 
 	case tcell.KeyTab:
-		// ПРИНЯТИЕ ПОДСКАЗКИ
-		if t.completionSuggestion != "" {
-			t.inputBuffer = append(t.inputBuffer, []rune(t.completionSuggestion)...)
-			t.cursorPos = len(t.inputBuffer)
-			t.completionSuggestion = "" // Сбрасываем после принятия
+		if len(t.completionMatches) > 0 {
+			// Циклическое переключение между подсказками
+			t.completionIndex = (t.completionIndex + 1) % len(t.completionMatches)
+			currentInput := string(t.inputBuffer)
+			t.completionSuggestion = t.completionMatches[t.completionIndex][len(currentInput):]
 		}
-		// Если подсказки нет - ничего не делаем
+		// Если совпадений нет - ничего не делаем
+
+	case tcell.KeyBacktab: // Shift+Tab
+		if len(t.completionMatches) > 0 {
+			// Циклическое переключение в обратную сторону
+			t.completionIndex = (t.completionIndex - 1 + len(t.completionMatches)) % len(t.completionMatches)
+			currentInput := string(t.inputBuffer)
+			t.completionSuggestion = t.completionMatches[t.completionIndex][len(currentInput):]
+		}
 
 	case tcell.KeyRune:
 		// При вводе нового символа обновляем подсказку
@@ -1945,103 +1899,3 @@ func (t *Terminal) insertRune(r rune) {
 	t.cursorPos++
 	// updateCompletionSuggestion теперь вызывается в handleKeyEvent
 }
-
-// // findCompletionMatches находит все совпадения для автодополнения
-// func (t *Terminal) findCompletionMatches() []string {
-// 	if len(t.inputBuffer) == 0 {
-// 		return []string{}
-// 	}
-//
-// 	currentInput := string(t.inputBuffer)
-// 	var matches []string
-// 	seen := make(map[string]bool) // Для исключения дубликатов
-//
-// 	// Сначала ищем точные префиксы в истории zsh
-// 	for i := len(t.zshHistory) - 1; i >= 0; i-- {
-// 		cmd := t.zshHistory[i]
-// 		if strings.HasPrefix(cmd, currentInput) && cmd != currentInput {
-// 			if !seen[cmd] {
-// 				matches = append(matches, cmd)
-// 				seen[cmd] = true
-// 			}
-// 		}
-// 	}
-//
-// 	// Затем в внутренней истории
-// 	for i := len(t.history) - 1; i >= 0; i-- {
-// 		cmd := t.history[i]
-// 		if strings.HasPrefix(cmd, currentInput) && cmd != currentInput {
-// 			if !seen[cmd] {
-// 				matches = append(matches, cmd)
-// 				seen[cmd] = true
-// 			}
-// 		}
-// 	}
-//
-// 	// Если точных префиксов не найдено, ищем частичные совпадения
-// 	// Сначала в истории zsh
-// 	if len(matches) == 0 {
-// 		for i := len(t.zshHistory) - 1; i >= 0; i-- {
-// 			cmd := t.zshHistory[i]
-// 			if strings.Contains(cmd, currentInput) && cmd != currentInput {
-// 				if !seen[cmd] {
-// 					matches = append(matches, cmd)
-// 					seen[cmd] = true
-// 				}
-// 			}
-// 		}
-//
-// 		// Затем в внутренней истории
-// 		for i := len(t.history) - 1; i >= 0; i-- {
-// 			cmd := t.history[i]
-// 			if strings.Contains(cmd, currentInput) && cmd != currentInput {
-// 				if !seen[cmd] {
-// 					matches = append(matches, cmd)
-// 					seen[cmd] = true
-// 				}
-// 			}
-// 		}
-// 	}
-//
-// 	return matches
-// }
-
-// autoComplete выполняет автодополнение текущего ввода на основе истории команд
-// .
-
-// cycleCompletion выполняет циклическое переключение между вариантами автодополнения
-// func (t *Terminal) cycleCompletion() {
-// 	if len(t.completionMatches) == 0 {
-// 		// Если нет сохраненных совпадений, пытаемся найти их
-// 		t.autoComplete()
-// 		return
-// 	}
-//
-// 	// Переходим к следующему совпадению (циклически)
-// 	t.completionIndex = (t.completionIndex + 1) % len(t.completionMatches)
-//
-// 	// Применяем текущее совпадение
-// 	currentMatch := t.completionMatches[t.completionIndex]
-// 	t.inputBuffer = []rune(currentMatch)
-// 	t.cursorPos = len(t.inputBuffer)
-// }
-
-// updateCompletionList обновляет список вариантов автодополнения на основе текущего ввода
-// func (t *Terminal) updateCompletionList() {
-// 	// Находим все совпадения
-// 	matches := t.findCompletionMatches()
-//
-// 	// Сохраняем совпадения
-// 	t.completionMatches = matches
-//
-// 	// Если есть совпадения, устанавливаем индекс на первое совпадение
-// 	if len(matches) > 0 {
-// 		t.completionIndex = 0
-// 	} else {
-// 		// Если совпадений нет, сбрасываем индекс
-// 		t.completionIndex = 0
-// 	}
-//
-// 	// Сбрасываем смещение скролла
-// 	t.completionScrollOffset = 0
-// }
